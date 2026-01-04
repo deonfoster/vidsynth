@@ -1,0 +1,20 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Mac system files
+.DS_Store
+
+# Heavy Media Files (DO NOT UPLOAD THESE)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+
+# Temporary Audio from Rubberband
+temp_audio/
+*_stretch_*.wav
