@@ -21,7 +21,7 @@ from PyQt6.QtMultimedia import (QMediaPlayer, QAudioOutput, QMediaDevices)
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt6.QtCore import (QUrl, Qt, QTimer, QEvent, QThread, pyqtSignal, 
                           QRectF, QPointF, QSizeF, QRect)
-from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QPolygonF, QFont, QCursor, QAction
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QPolygonF, QFont, QCursor, QAction, QKeySequence
 
 # --- STYLING ---
 DARK_THEME = """
@@ -115,7 +115,7 @@ class LoopBar(QWidget):
         self.dragging = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
-# --- PIANO ROLL SEQUENCER ---
+# --- PIANO ROLL SEQUENCER (QUANTIZE ADDED) ---
 class PianoRollSequencer(QWidget):
     def __init__(self, parent_app):
         super().__init__()
@@ -128,11 +128,10 @@ class PianoRollSequencer(QWidget):
         
         self.current_step = 0
         self.steps = 64
-        
-        # Loop State
         self.loop_start = 0
         self.loop_length = 64
         
+        # Interaction State
         self.mode = "IDLE" 
         self.drag_start_pos = QPointF()
         self.last_mouse_pos = QPointF() 
@@ -140,9 +139,75 @@ class PianoRollSequencer(QWidget):
         self.move_snapshot = {} 
         self.clean_slate_points = {}
         
+        # UNDO/REDO
+        self.undo_stack = []
+        self.redo_stack = []
+        self.state_at_press = {}
+        
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus) 
 
+    # --- QUANTIZE LOGIC ---
+    def quantize_selection(self, grid=4):
+        """ Snaps selected notes to the nearest grid interval """
+        if not self.selection: return
+        
+        # Save state for Undo
+        self.push_to_undo(self.points.copy())
+        
+        new_points = self.points.copy()
+        new_selection = set()
+        
+        # Process selected notes
+        # We must collect moves first to avoid overwriting issues during iteration
+        moves = []
+        for step in list(self.selection):
+            if step in new_points:
+                val = new_points[step]
+                # Calculate nearest grid point
+                target = round(step / grid) * grid
+                target = max(0, min(target, 63)) # Clamp
+                moves.append((step, target, val))
+        
+        # Apply moves
+        for old_step, new_step, val in moves:
+            # Remove from old location
+            if old_step in new_points:
+                del new_points[old_step]
+            
+        for old_step, new_step, val in moves:
+            # Place in new location (latest one wins if collision)
+            new_points[new_step] = val
+            new_selection.add(new_step)
+            
+        self.points = new_points
+        self.selection = new_selection
+        self.update()
+        self.parent_app.save_curve_data()
+
+    # --- UNDO/REDO ---
+    def push_to_undo(self, state):
+        self.undo_stack.append(state)
+        if len(self.undo_stack) > 50: self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def perform_undo(self):
+        if not self.undo_stack: return
+        self.redo_stack.append(self.points.copy())
+        self.points = self.undo_stack.pop()
+        self.selection.clear()
+        self.update()
+        self.parent_app.save_curve_data()
+
+    def perform_redo(self):
+        if not self.redo_stack: return
+        self.undo_stack.append(self.points.copy())
+        self.points = self.redo_stack.pop()
+        self.selection.clear()
+        self.update()
+        self.parent_app.save_curve_data()
+
+    # --- STANDARD METHODS ---
     def set_loop_window(self, start, length):
         self.loop_length = length
         self.loop_start = max(0, min(start, 64 - length))
@@ -153,6 +218,8 @@ class PianoRollSequencer(QWidget):
     def set_data(self, data):
         self.points = data.copy() if data else {}
         self.selection.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         self.update()
 
     def get_data(self): return self.points
@@ -175,7 +242,22 @@ class PianoRollSequencer(QWidget):
         return QRectF(x, y, step_w, block_h)
 
     def keyPressEvent(self, event):
+        # QUANTIZE (Q)
+        if event.key() == Qt.Key.Key_Q:
+            self.quantize_selection()
+            return
+
+        # UNDO (Ctrl + Z)
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Z:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.perform_redo()
+            else:
+                self.perform_undo()
+            return
+
+        # DELETE
         if event.key() in [Qt.Key.Key_Delete, Qt.Key.Key_Backspace]:
+            self.push_to_undo(self.points.copy())
             for step in list(self.selection):
                 if step in self.points: del self.points[step]
             self.selection.clear()
@@ -204,6 +286,8 @@ class PianoRollSequencer(QWidget):
 
     def mousePressEvent(self, event):
         self.setFocus() 
+        self.state_at_press = self.points.copy()
+        
         pos = event.position()
         self.last_mouse_pos = pos 
         step = self.get_step_from_x(pos.x())
@@ -316,6 +400,9 @@ class PianoRollSequencer(QWidget):
         self.last_mouse_pos = pos
 
     def mouseReleaseEvent(self, event):
+        if self.points != self.state_at_press:
+            self.push_to_undo(self.state_at_press)
+        
         self.mode = "IDLE"
         self.marquee_rect = QRectF()
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -631,7 +718,7 @@ class InteractiveWaveform(QLabel):
 class LooperApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VJ Piano Roll Sequencer v15.1 (Stable)")
+        self.setWindowTitle("VJ Piano Roll Sequencer v16.0 (Quantize)")
         self.resize(800, 1000)
         QApplication.instance().setStyleSheet(DARK_THEME)
 
@@ -658,7 +745,6 @@ class LooperApp(QMainWindow):
         self.active_clip_a = None; self.active_clip_b = None
         self.current_bank = 0; self.current_generation = 0; self.active_workers = []
         self.crossfader_value = 0.0; self.master_bpm = 120.0; self.tap_times = []
-        # FIX: Init start time
         self.transport_start_time = time.time()
         
         self.seq_running = False; self.current_step = 0
@@ -733,8 +819,15 @@ class LooperApp(QMainWindow):
         cur_tools = QHBoxLayout()
         self.rad_a = QRadioButton("EDIT A"); self.rad_a.setChecked(True); self.rad_a.toggled.connect(self.update_curve_ui)
         self.rad_b = QRadioButton("EDIT B"); self.rad_b.toggled.connect(self.update_curve_ui)
+        
+        # New Quantize Button
+        btn_quant = QPushButton("QUANTIZE (Q)")
+        btn_quant.clicked.connect(lambda: self.piano_roll.quantize_selection())
+        
         self.btn_run = QPushButton("RUN SEQ (P)"); self.btn_run.setCheckable(True); self.btn_run.clicked.connect(self.toggle_sequencer)
-        cur_tools.addWidget(self.rad_a); cur_tools.addWidget(self.rad_b); cur_tools.addWidget(self.btn_run)
+        
+        cur_tools.addWidget(self.rad_a); cur_tools.addWidget(self.rad_b); 
+        cur_tools.addWidget(btn_quant); cur_tools.addWidget(self.btn_run)
         l.addLayout(cur_tools)
 
         self.piano_roll = PianoRollSequencer(self)
