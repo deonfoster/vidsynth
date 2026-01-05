@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import numpy as np
 import librosa
+import mido 
 from pydub import AudioSegment
 
 # --- IMPORTS ---
@@ -15,12 +16,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout,
                              QLabel, QVBoxLayout, QPushButton, QSlider,
                              QFileDialog, QHBoxLayout, QComboBox, QScrollArea,
                              QSpinBox, QRadioButton, QButtonGroup, QFrame,
-                             QGraphicsView, QGraphicsScene) 
+                             QGraphicsView, QGraphicsScene, QDialog, QTableWidget,
+                             QTableWidgetItem, QHeaderView, QMessageBox, QCheckBox) 
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtMultimedia import (QMediaPlayer, QAudioOutput, QMediaDevices)
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt6.QtCore import (QUrl, Qt, QTimer, QEvent, QThread, pyqtSignal, 
-                          QRectF, QPointF, QSizeF, QRect)
+                          QRectF, QPointF, QSizeF, QRect, QObject)
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPixmap, QPolygonF, QFont, QCursor, QAction, QKeySequence
 
 # --- STYLING ---
@@ -39,6 +41,9 @@ QPushButton[loop="true"] { min-width: 40px; font-size: 12px; }
 QRadioButton { color: #cccccc; font-weight: bold; background-color: transparent; }
 QRadioButton::indicator { width: 14px; height: 14px; border-radius: 7px; border: 1px solid #555; background-color: #222; }
 QRadioButton::indicator:checked { background-color: #00CCFF; border: 2px solid white; }
+QCheckBox { color: #cccccc; font-weight: bold; spacing: 8px; }
+QCheckBox::indicator { width: 18px; height: 18px; background-color: #222; border: 1px solid #555; border-radius: 3px; }
+QCheckBox::indicator:checked { background-color: #00CCFF; border: 1px solid white; image: none; }
 QSpinBox, QComboBox { background-color: #222; color: #ffffff; border: 1px solid #444; padding: 6px; border-radius: 3px; font-weight: bold; }
 QComboBox::drop-down { border: none; }
 QComboBox QAbstractItemView { background-color: #222; color: white; selection-background-color: #00CCFF; selection-color: black; }
@@ -47,458 +52,62 @@ QSlider::handle:horizontal { background: #00CCFF; border: 1px solid #00CCFF; wid
 QSlider::sub-page:horizontal { background: #444; border-radius: 4px; }
 QScrollBar:vertical { border: none; background: #1a1a1a; width: 12px; margin: 0px; }
 QScrollBar::handle:vertical { background: #444; min-height: 20px; border-radius: 6px; }
+QTableWidget { background-color: #1a1a1a; gridline-color: #333; border: 1px solid #444; }
+QHeaderView::section { background-color: #2a2a2a; padding: 4px; border: 1px solid #444; }
+QTableWidget::item:selected { background-color: #00CCFF; color: black; }
 """
 
 KEY_MAP = {'a': (0, 0, "#FF0055"), 's': (0, 1, "#00CCFF"), 'd': (1, 0, "#00FF66"), 'f': (1, 1, "#FFAA00")}
 
-# --- LOOP BAR WIDGET ---
-class LoopBar(QWidget):
-    def __init__(self, parent_sequencer):
+# ==========================================
+# 1. WORKERS & HELPERS
+# ==========================================
+
+class MidiWorker(QThread):
+    message_received = pyqtSignal(object) 
+    def __init__(self):
         super().__init__()
-        self.sequencer = parent_sequencer
-        self.setFixedHeight(30)
-        self.setStyleSheet("background-color: #1a1a1a; border-bottom: 1px solid #333;")
-        self.setMouseTracking(True)
-        self.dragging = False
-        self.drag_start_x = 0
-        self.start_step_cache = 0
+        self.input_port = None
+        self.port_name = None
+        self.running = False
+    def set_port(self, name):
+        if self.input_port: self.input_port.close()
+        self.port_name = name
+    def run(self):
+        self.running = True
+        if not self.port_name: return
+        try:
+            with mido.open_input(self.port_name) as port:
+                self.input_port = port
+                while self.running:
+                    for msg in port.iter_pending(): self.message_received.emit(msg)
+                    time.sleep(0.001) 
+        except: pass
+    def stop(self): self.running = False; self.wait()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        w = self.width()
-        h = self.height()
-        step_w = w / 64.0
-
-        painter.fillRect(self.rect(), QColor("#111"))
-
-        start_x = self.sequencer.loop_start * step_w
-        loop_w = self.sequencer.loop_length * step_w
-        
-        bar_rect = QRectF(start_x, 2, loop_w, h - 4)
-        painter.setBrush(QColor("#00CCFF"))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(bar_rect, 4, 4)
-        
-        painter.setPen(QColor("black"))
-        painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-        label = f"{self.sequencer.loop_length} STEPS"
-        painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, label)
-
-    def mousePressEvent(self, event):
-        step_w = self.width() / 64.0
-        start_x = self.sequencer.loop_start * step_w
-        loop_w = self.sequencer.loop_length * step_w
-        bar_rect = QRectF(start_x, 0, loop_w, self.height())
-
-        if bar_rect.contains(event.position()):
-            self.dragging = True
-            self.drag_start_x = event.position().x()
-            self.start_step_cache = self.sequencer.loop_start
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
-        else:
-            click_step = int(event.position().x() / step_w)
-            new_start = click_step - (self.sequencer.loop_length // 2)
-            self.sequencer.set_loop_window(new_start, self.sequencer.loop_length)
-            self.update()
-
-    def mouseMoveEvent(self, event):
-        if self.dragging:
-            step_w = self.width() / 64.0
-            delta_pixels = event.position().x() - self.drag_start_x
-            delta_steps = int(delta_pixels / step_w)
-            
-            new_start = self.start_step_cache + delta_steps
-            self.sequencer.set_loop_window(new_start, self.sequencer.loop_length)
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        self.dragging = False
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-
-# --- PIANO ROLL SEQUENCER (QUANTIZE ADDED) ---
-class PianoRollSequencer(QWidget):
-    def __init__(self, parent_app):
-        super().__init__()
-        self.parent_app = parent_app
-        self.setMinimumHeight(300)
-        self.setStyleSheet("background-color: #080808; border: 2px solid #333; margin-top: 0px; border-radius: 0px 0px 4px 4px;")
-        
-        self.points = {} 
-        self.selection = set()
-        
-        self.current_step = 0
-        self.steps = 64
-        self.loop_start = 0
-        self.loop_length = 64
-        
-        # Interaction State
-        self.mode = "IDLE" 
-        self.drag_start_pos = QPointF()
-        self.last_mouse_pos = QPointF() 
-        self.marquee_rect = QRectF()
-        self.move_snapshot = {} 
-        self.clean_slate_points = {}
-        
-        # UNDO/REDO
-        self.undo_stack = []
-        self.redo_stack = []
-        self.state_at_press = {}
-        
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus) 
-
-    # --- QUANTIZE LOGIC ---
-    def quantize_selection(self, grid=4):
-        """ Snaps selected notes to the nearest grid interval """
-        if not self.selection: return
-        
-        # Save state for Undo
-        self.push_to_undo(self.points.copy())
-        
-        new_points = self.points.copy()
-        new_selection = set()
-        
-        # Process selected notes
-        # We must collect moves first to avoid overwriting issues during iteration
-        moves = []
-        for step in list(self.selection):
-            if step in new_points:
-                val = new_points[step]
-                # Calculate nearest grid point
-                target = round(step / grid) * grid
-                target = max(0, min(target, 63)) # Clamp
-                moves.append((step, target, val))
-        
-        # Apply moves
-        for old_step, new_step, val in moves:
-            # Remove from old location
-            if old_step in new_points:
-                del new_points[old_step]
-            
-        for old_step, new_step, val in moves:
-            # Place in new location (latest one wins if collision)
-            new_points[new_step] = val
-            new_selection.add(new_step)
-            
-        self.points = new_points
-        self.selection = new_selection
-        self.update()
-        self.parent_app.save_curve_data()
-
-    # --- UNDO/REDO ---
-    def push_to_undo(self, state):
-        self.undo_stack.append(state)
-        if len(self.undo_stack) > 50: self.undo_stack.pop(0)
-        self.redo_stack.clear()
-
-    def perform_undo(self):
-        if not self.undo_stack: return
-        self.redo_stack.append(self.points.copy())
-        self.points = self.undo_stack.pop()
-        self.selection.clear()
-        self.update()
-        self.parent_app.save_curve_data()
-
-    def perform_redo(self):
-        if not self.redo_stack: return
-        self.undo_stack.append(self.points.copy())
-        self.points = self.redo_stack.pop()
-        self.selection.clear()
-        self.update()
-        self.parent_app.save_curve_data()
-
-    # --- STANDARD METHODS ---
-    def set_loop_window(self, start, length):
-        self.loop_length = length
-        self.loop_start = max(0, min(start, 64 - length))
-        self.update()
-        if hasattr(self.parent_app, 'loop_bar'):
-            self.parent_app.loop_bar.update()
-
-    def set_data(self, data):
-        self.points = data.copy() if data else {}
-        self.selection.clear()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self.update()
-
-    def get_data(self): return self.points
-
-    def get_step_from_x(self, x):
-        step_w = self.width() / self.steps
-        return max(0, min(int(x / step_w), self.steps - 1))
-
-    def get_val_from_y(self, y):
-        val = 1.0 - (y / self.height())
-        return max(0.0, min(val, 1.0))
-
-    def get_rect_for_note(self, step, val):
-        step_w = self.width() / self.steps
-        h = self.height()
-        block_h = 20
-        x = int(step * step_w)
-        y = int(h - (val * h)) - (block_h // 2)
-        y = max(0, min(y, h - block_h))
-        return QRectF(x, y, step_w, block_h)
-
-    def keyPressEvent(self, event):
-        # QUANTIZE (Q)
-        if event.key() == Qt.Key.Key_Q:
-            self.quantize_selection()
-            return
-
-        # UNDO (Ctrl + Z)
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Z:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                self.perform_redo()
-            else:
-                self.perform_undo()
-            return
-
-        # DELETE
-        if event.key() in [Qt.Key.Key_Delete, Qt.Key.Key_Backspace]:
-            self.push_to_undo(self.points.copy())
-            for step in list(self.selection):
-                if step in self.points: del self.points[step]
-            self.selection.clear()
-            self.update()
-            self.parent_app.save_curve_data()
-        else:
-            super().keyPressEvent(event)
-
-    def erase_at_pos(self, pos):
-        step = self.get_step_from_x(pos.x())
-        if step in self.points:
-            val = self.points[step]
-            rect = self.get_rect_for_note(step, val)
-            if rect.adjusted(-5, -20, 5, 20).contains(pos):
-                del self.points[step]
-                if step in self.selection: self.selection.remove(step)
-                self.update()
-
-    def interpolate_erase(self, p1, p2):
-        steps = int(math.hypot(p2.x()-p1.x(), p2.y()-p1.y()) / 5) + 1 
-        for i in range(steps + 1):
-            t = i / steps
-            x = p1.x() + (p2.x() - p1.x()) * t
-            y = p1.y() + (p2.y() - p1.y()) * t
-            self.erase_at_pos(QPointF(x, y))
-
-    def mousePressEvent(self, event):
-        self.setFocus() 
-        self.state_at_press = self.points.copy()
-        
-        pos = event.position()
-        self.last_mouse_pos = pos 
-        step = self.get_step_from_x(pos.x())
-        val = self.get_val_from_y(pos.y())
-        
-        if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) or (event.button() == Qt.MouseButton.RightButton):
-            self.mode = "ERASING"
-            self.setCursor(Qt.CursorShape.ForbiddenCursor)
-            self.erase_at_pos(pos)
-            return
-
-        clicked_note_step = -1
-        for s, v in self.points.items():
-            rect = self.get_rect_for_note(s, v)
-            if rect.adjusted(-2, -5, 2, 5).contains(pos):
-                clicked_note_step = s
-                break
-
-        if clicked_note_step != -1:
-            if clicked_note_step not in self.selection:
-                if not (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier):
-                    self.selection.clear()
-                self.selection.add(clicked_note_step)
-            
-            self.mode = "MOVING"
-            self.drag_start_pos = pos
-            self.move_snapshot = {s: self.points[s] for s in self.selection}
-            
-            if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
-                self.clean_slate_points = self.points.copy() 
-                self.setCursor(Qt.CursorShape.DragCopyCursor)
-            else:
-                self.clean_slate_points = self.points.copy()
-                for s in self.selection:
-                    if s in self.clean_slate_points: del self.clean_slate_points[s]
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            
-            self.points = self.clean_slate_points.copy()
-            
-        else:
-            if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
-                self.mode = "SELECTING"
-                self.drag_start_pos = pos
-                self.marquee_rect = QRectF(pos, pos)
-            else:
-                if self.selection:
-                    self.selection.clear()
-                    self.mode = "IDLE"
-                else:
-                    self.selection.clear()
-                    self.mode = "DRAWING"
-                    self.points[step] = val
-                    self.selection.add(step)
-                    self.setCursor(Qt.CursorShape.CrossCursor)
-        self.update()
-
-    def mouseMoveEvent(self, event):
-        pos = event.position()
-        
-        if self.mode == "ERASING":
-            self.interpolate_erase(self.last_mouse_pos, pos)
-
-        elif self.mode == "SELECTING":
-            self.marquee_rect = QRectF(self.dragged_rect(self.drag_start_pos, pos))
-            self.selection.clear()
-            for s, v in self.points.items():
-                rect = self.get_rect_for_note(s, v)
-                if self.marquee_rect.intersects(rect):
-                    self.selection.add(s)
-            self.update()
-
-        elif self.mode == "MOVING":
-            step_w = self.width() / self.steps
-            delta_steps = int((pos.x() - self.drag_start_pos.x()) / step_w)
-            delta_val = -(pos.y() - self.drag_start_pos.y()) / self.height()
-            
-            min_step = min(self.move_snapshot.keys())
-            max_step = max(self.move_snapshot.keys())
-            if min_step + delta_steps < 0: delta_steps = -min_step
-            if max_step + delta_steps > 63: delta_steps = 63 - max_step
-            
-            self.points = self.clean_slate_points.copy()
-            new_selection = set()
-            for old_step, old_val in self.move_snapshot.items():
-                new_step = old_step + delta_steps
-                new_val = max(0.0, min(old_val + delta_val, 1.0))
-                self.points[new_step] = new_val
-                new_selection.add(new_step)
-            
-            self.selection = new_selection
-            self.update()
-
-        elif self.mode == "DRAWING":
-            step = self.get_step_from_x(pos.x())
-            val = self.get_val_from_y(pos.y())
-            self.points[step] = val
-            self.selection.add(step)
-            self.update()
-            
-        else:
-            step = self.get_step_from_x(pos.x())
-            hover = False
-            for s, v in self.points.items():
-                if s == step: 
-                    rect = self.get_rect_for_note(s, v)
-                    if rect.contains(pos): hover = True; break
-            if hover: self.setCursor(Qt.CursorShape.OpenHandCursor)
-            else: self.setCursor(Qt.CursorShape.ArrowCursor)
-            
-        self.last_mouse_pos = pos
-
-    def mouseReleaseEvent(self, event):
-        if self.points != self.state_at_press:
-            self.push_to_undo(self.state_at_press)
-        
-        self.mode = "IDLE"
-        self.marquee_rect = QRectF()
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.move_snapshot = {}
-        self.clean_slate_points = {}
-        self.parent_app.save_curve_data()
-        self.update()
-
-    def dragged_rect(self, p1, p2): return QRectF(p1, p2).normalized()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        w = self.width(); h = self.height(); step_w = w / self.steps
-
-        painter.fillRect(self.rect(), QColor("#080808"))
-
-        loop_x = int(self.loop_start * step_w)
-        loop_w_px = int(self.loop_length * step_w)
-        
-        dim_color = QColor(0, 0, 0, 180)
-        painter.fillRect(0, 0, loop_x, h, dim_color)
-        painter.fillRect(loop_x + loop_w_px, 0, w - (loop_x + loop_w_px), h, dim_color)
-
-        painter.setPen(QPen(QColor(40, 40, 40), 1))
-        for i in range(0, self.steps, 4):
-            x = int(i * step_w)
-            painter.setPen(QPen(QColor(60, 60, 60), 1))
-            painter.drawLine(x, 0, x, h)
-        painter.setPen(QPen(QColor(30, 30, 30), 1))
-        for i in range(1, 5):
-            y = int(i * (h/5))
-            painter.drawLine(0, y, w, y)
-
-        ph_x = int(self.current_step * step_w)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 30))
-        painter.drawRect(ph_x, 0, int(step_w), h)
-
-        for step, val in self.points.items():
-            rect = self.get_rect_for_note(step, val)
-            is_in_loop = self.loop_start <= step < (self.loop_start + self.loop_length)
-            
-            if step in self.selection:
-                painter.setBrush(QColor("#FFFFFF"))
-                painter.setPen(QPen(QColor("#00CCFF"), 2))
-            else:
-                base_col = QColor("#00CCFF")
-                if not is_in_loop: base_col = QColor("#004455") 
-                painter.setBrush(base_col)
-                painter.setPen(QPen(QColor(0, 0, 0), 1))
-            
-            painter.drawRect(rect)
-            
-            stem_x = int(rect.center().x())
-            stem_y = int(rect.bottom())
-            stem_col = QColor(0, 204, 255, 60) if is_in_loop else QColor(0, 50, 60, 40)
-            painter.setPen(QPen(stem_col, 1))
-            painter.drawLine(stem_x, stem_y, stem_x, h)
-
-        if self.mode == "SELECTING":
-            painter.setPen(QPen(QColor(255, 255, 255), 1, Qt.PenStyle.DashLine))
-            painter.setBrush(QColor(255, 255, 255, 30))
-            painter.drawRect(self.marquee_rect)
-
-# --- WORKERS (Unchanged) ---
 class AudioAnalysisWorker(QThread):
     finished = pyqtSignal(str, QPixmap, float, int, object, int, str)
     def __init__(self, key, filepath, width, height, color_hex, gen_id):
         super().__init__()
         self.key, self.filepath, self.width, self.height = key, filepath, width, height
         self.bg_color, self.gen_id = QColor(color_hex), gen_id
-
     def run(self):
         try:
             if self.isInterruptionRequested(): return
             audio_full = AudioSegment.from_file(self.filepath)
-            
             temp_dir = os.path.join(os.getcwd(), "temp_audio")
             if not os.path.exists(temp_dir): os.makedirs(temp_dir)
             clean_name = os.path.basename(self.filepath).replace(" ", "_")
             wav_path = os.path.join(temp_dir, f"{clean_name}_base.wav")
-            if not os.path.exists(wav_path):
-                audio_full.export(wav_path, format="wav")
-
+            if not os.path.exists(wav_path): audio_full.export(wav_path, format="wav")
             duration_ms = len(audio_full)
             if duration_ms > 60000: audio_vis = audio_full[:60000]
             else: audio_vis = audio_full
-            
             raw_samples = np.array(audio_full.get_array_of_samples())
             sample_rate = audio_full.frame_rate
-
             vis_samples = np.array(audio_vis.set_channels(1).set_frame_rate(11025).get_array_of_samples())
             tempo, _ = librosa.beat.beat_track(y=vis_samples.astype(np.float32)/32768.0, sr=11025)
             bpm = float(tempo.item()) if isinstance(tempo, np.ndarray) else float(round(tempo, 2))
-
             draw_samples = vis_samples[::150]
             pixmap = QPixmap(self.width, self.height)
             pixmap.fill(Qt.GlobalColor.transparent)
@@ -513,9 +122,7 @@ class AudioAnalysisWorker(QThread):
                     h = abs(draw_samples[idx]) * (self.height * 0.9) / 32768.0
                     painter.drawLine(x, int(center_y - h/2), x, int(center_y + h/2))
             painter.end()
-            
-            if not self.isInterruptionRequested(): 
-                self.finished.emit(self.key, pixmap, bpm, duration_ms, raw_samples, sample_rate, wav_path)
+            if not self.isInterruptionRequested(): self.finished.emit(self.key, pixmap, bpm, duration_ms, raw_samples, sample_rate, wav_path)
         except:
             if not self.isInterruptionRequested(): self.finished.emit(self.key, QPixmap(), 120.0, 0, None, 44100, "")
 
@@ -524,7 +131,6 @@ class RubberBandWorker(QThread):
     def __init__(self, key, original_wav, tempo_ratio):
         super().__init__()
         self.key, self.original_wav, self.tempo_ratio = key, original_wav, tempo_ratio
-
     def run(self):
         try:
             if not os.path.exists(self.original_wav) or self.tempo_ratio <= 0: return
@@ -537,102 +143,71 @@ class RubberBandWorker(QThread):
             self.finished.emit(self.key, out_path, self.tempo_ratio)
         except: pass
 
-# --- DECK ---
+# ==========================================
+# 2. CORE COMPONENTS
+# ==========================================
+
 class VJDeck:
     def __init__(self, name, video_item):
-        self.name = name
-        self.video_item = video_item
-        self.current_filepath = None
-        self.base_wav_path = None
+        self.name = name; self.video_item = video_item
+        self.current_filepath = None; self.base_wav_path = None
+        self.is_looping = True 
         
-        self.player = QMediaPlayer()
-        self.player.setVideoOutput(self.video_item)
-        self.player.setLoops(QMediaPlayer.Loops.Infinite)
+        self.player = QMediaPlayer(); self.player.setVideoOutput(self.video_item)
+        self.player.setLoops(QMediaPlayer.Loops.Infinite) 
+        self.player.mediaStatusChanged.connect(self.on_media_status)
+        
         self.video_audio = QAudioOutput(); self.player.setAudioOutput(self.video_audio); self.video_audio.setVolume(0) 
+        self.audio_player = QMediaPlayer(); self.main_output = QAudioOutput(); self.audio_player.setAudioOutput(self.main_output); self.audio_player.setLoops(QMediaPlayer.Loops.Infinite)
+        self.cue_player = QMediaPlayer(); self.cue_output = QAudioOutput(); self.cue_player.setAudioOutput(self.cue_output); self.cue_player.setLoops(QMediaPlayer.Loops.Infinite)
+        self.cue_active = False; self.raw_samples = None; self.sample_rate = 44100; self.target_volume = 1.0; self.playback_rate = 1.0
+        self.fade_level = 1.0; self.fade_timer = QTimer(); self.fade_timer.setInterval(10); self.fade_timer.timeout.connect(self._process_fade)
 
-        self.audio_player = QMediaPlayer()
-        self.main_output = QAudioOutput()
-        self.audio_player.setAudioOutput(self.main_output)
-        self.audio_player.setLoops(QMediaPlayer.Loops.Infinite)
-        
-        self.cue_player = QMediaPlayer()
-        self.cue_output = QAudioOutput()
-        self.cue_player.setAudioOutput(self.cue_output)
-        self.cue_player.setLoops(QMediaPlayer.Loops.Infinite)
-        
-        self.cue_active = False 
-        self.raw_samples = None
-        self.sample_rate = 44100
-        self.target_volume = 1.0 
-        self.playback_rate = 1.0
-        
-        self.fade_level = 1.0
-        self.fade_timer = QTimer()
-        self.fade_timer.setInterval(10)
-        self.fade_timer.timeout.connect(self._process_fade)
+    def set_loop_mode(self, looping):
+        self.is_looping = looping
+        loop_const = QMediaPlayer.Loops.Infinite if looping else QMediaPlayer.Loops.Once
+        self.player.setLoops(loop_const)
+        self.audio_player.setLoops(loop_const)
+        self.cue_player.setLoops(loop_const)
+
+    def on_media_status(self, status):
+        if not self.is_looping and status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.audio_player.stop()
+            self.cue_player.stop()
 
     def load_video(self, filepath):
-        self.current_filepath = filepath
-        self.player.setSource(QUrl.fromLocalFile(filepath))
-
+        self.current_filepath = filepath; self.player.setSource(QUrl.fromLocalFile(filepath))
     def load_base_audio(self, wav_path):
-        self.base_wav_path = wav_path
-        self.swap_audio(wav_path, reset_rate_to_video=True)
-
+        self.base_wav_path = wav_path; self.swap_audio(wav_path, reset_rate_to_video=True)
     def swap_audio(self, path, reset_rate_to_video=False):
-        pos = self.player.position()
-        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        url = QUrl.fromLocalFile(path)
-        
-        self.audio_player.setSource(url)
-        self.cue_player.setSource(url)
-        
+        pos = self.player.position(); playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState; url = QUrl.fromLocalFile(path)
+        self.audio_player.setSource(url); self.cue_player.setSource(url)
+        loop_const = QMediaPlayer.Loops.Infinite if self.is_looping else QMediaPlayer.Loops.Once
+        self.audio_player.setLoops(loop_const); self.cue_player.setLoops(loop_const)
         if reset_rate_to_video:
-            self.audio_player.setPlaybackRate(self.playback_rate)
-            self.cue_player.setPlaybackRate(self.playback_rate)
-            self.audio_player.setPosition(pos)
-            self.cue_player.setPosition(pos)
+            self.audio_player.setPlaybackRate(self.playback_rate); self.cue_player.setPlaybackRate(self.playback_rate)
+            self.audio_player.setPosition(pos); self.cue_player.setPosition(pos)
         else:
-            self.audio_player.setPlaybackRate(1.0)
-            self.cue_player.setPlaybackRate(1.0)
-            mapped_pos = int(pos / self.playback_rate)
-            self.audio_player.setPosition(mapped_pos)
-            self.cue_player.setPosition(mapped_pos)
-
-        if playing:
-            self.audio_player.play()
-            if self.cue_active: self.cue_player.play()
-
+            self.audio_player.setPlaybackRate(1.0); self.cue_player.setPlaybackRate(1.0)
+            mapped_pos = int(pos / self.playback_rate); self.audio_player.setPosition(mapped_pos); self.cue_player.setPosition(mapped_pos)
+        if playing: self.audio_player.play(); self.cue_player.play() if self.cue_active else None
     def has_media(self): return self.player.mediaStatus() != QMediaPlayer.MediaStatus.NoMedia
     def set_audio_data(self, samples, rate): self.raw_samples = samples; self.sample_rate = rate
-
     def find_zero_crossing(self, target_ms):
         if self.raw_samples is None: return target_ms
         idx = int((target_ms / 1000.0) * self.sample_rate); idx -= idx % 2 
         win = int(0.02 * self.sample_rate); s = max(0, idx - win); e = min(len(self.raw_samples), idx + win)
         if s >= e: return target_ms
         return int(((s + np.argmin(np.abs(self.raw_samples[s:e]))) / self.sample_rate) * 1000.0)
-
+    
     def trigger(self, pos):
-        self.main_output.setMuted(True)
-        if self.cue_active: self.cue_output.setMuted(True)
-        
-        safe_pos = self.find_zero_crossing(pos)
-        self.player.setPosition(safe_pos)
-        
+        self.main_output.setMuted(True); self.cue_output.setMuted(True) if self.cue_active else None
+        safe_pos = self.find_zero_crossing(pos); self.player.setPosition(safe_pos)
         audio_pos = safe_pos
-        if self.audio_player.playbackRate() == 1.0 and self.playback_rate != 1.0:
-            audio_pos = int(safe_pos / self.playback_rate)
-            
-        self.audio_player.setPosition(audio_pos)
-        if self.cue_active: self.cue_player.setPosition(audio_pos)
-
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self.player.play(); self.audio_player.play()
-            if self.cue_active: self.cue_player.play()
-
-        self.fade_level = 0.0
-        self.main_output.setVolume(0); self.main_output.setMuted(False)
+        if self.audio_player.playbackRate() == 1.0 and self.playback_rate != 1.0: audio_pos = int(safe_pos / self.playback_rate)
+        self.audio_player.setPosition(audio_pos); self.cue_player.setPosition(audio_pos) if self.cue_active else None
+        self.player.play(); self.audio_player.play(); self.cue_player.play() if self.cue_active else None
+        self.fade_level = 0.0; self.main_output.setVolume(0); self.main_output.setMuted(False)
         if self.cue_active: self.cue_output.setVolume(0); self.cue_output.setMuted(False)
         if not self.fade_timer.isActive(): self.fade_timer.start()
 
@@ -641,40 +216,28 @@ class VJDeck:
         if self.fade_level >= 1.0: self.fade_level = 1.0; self.fade_timer.stop()
         self.main_output.setVolume(self.target_volume * self.fade_level)
         if self.cue_active: self.cue_output.setVolume(1.0 * self.fade_level)
-
-    def set_volume(self, vol):
-        self.target_volume = vol
-        if not self.fade_timer.isActive(): self.main_output.setVolume(vol)
-
+    def set_volume(self, vol): self.target_volume = vol; self.main_output.setVolume(vol) if not self.fade_timer.isActive() else None
     def set_cue_active(self, active):
         self.cue_active = active
         if active:
-            self.cue_output.setVolume(1.0)
-            self.cue_player.setPosition(self.audio_player.position())
+            self.cue_output.setVolume(1.0); self.cue_player.setPosition(self.audio_player.position())
             if self.audio_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState: self.cue_player.play()
-        else:
-            self.cue_output.setVolume(0)
-
-    def play(self): self.player.play(); self.audio_player.play(); self.cue_player.play() if self.cue_active else None
+        else: self.cue_output.setVolume(0)
+    def play(self): 
+        if not self.is_looping and self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia: self.seek(0)
+        self.player.play(); self.audio_player.play(); self.cue_player.play() if self.cue_active else None
     def pause(self): self.player.pause(); self.audio_player.pause(); self.cue_player.pause()
-    
     def seek(self, pos): 
         self.player.setPosition(pos)
         a_pos = int(pos / self.playback_rate) if (self.audio_player.playbackRate() == 1.0 and self.playback_rate != 1.0) else pos
-        self.audio_player.setPosition(a_pos)
-        if self.cue_active: self.cue_player.setPosition(a_pos)
+        self.audio_player.setPosition(a_pos); self.cue_player.setPosition(a_pos) if self.cue_active else None
     def position(self): return self.player.position()
     def duration(self): return self.player.duration()
     def playbackState(self): return self.player.playbackState()
-    
     def setPlaybackRate(self, rate): 
-        self.playback_rate = rate
-        self.player.setPlaybackRate(rate)
-        if self.base_wav_path and self.audio_player.playbackRate() == 1.0:
-             self.swap_audio(self.base_wav_path, reset_rate_to_video=True)
-        self.audio_player.setPlaybackRate(rate)
-        self.cue_player.setPlaybackRate(rate)
-        
+        self.playback_rate = rate; self.player.setPlaybackRate(rate)
+        if self.base_wav_path and self.audio_player.playbackRate() == 1.0: self.swap_audio(self.base_wav_path, reset_rate_to_video=True)
+        self.audio_player.setPlaybackRate(rate); self.cue_player.setPlaybackRate(rate)
     def set_main_output(self, device): self.main_output.setDevice(device)
     def set_cue_output(self, device): self.cue_output.setDevice(device)
 
@@ -682,28 +245,19 @@ class InteractiveWaveform(QLabel):
     def __init__(self, key_char, color, parent_app):
         super().__init__()
         self.key_char, self.parent_app = key_char, parent_app
-        self.setAcceptDrops(True); self.setMouseTracking(True)
-        self.base_color = QColor(color)
-        self.setFixedSize(200, 120)
-        self.setStyleSheet(f"border: 2px solid {color}; border-radius: 8px; background-color: #222;")
+        self.setAcceptDrops(True); self.setMouseTracking(True); self.base_color = QColor(color)
+        self.setFixedSize(200, 120); self.setStyleSheet(f"border: 2px solid {color}; border-radius: 8px; background-color: #222;")
         self.filename = "[Empty]"; self.bpm_text = ""; self.waveform_pixmap = None
         self.playhead_x = 0; self.is_deck_a = False; self.is_deck_b = False
         self.loading = False; self.hotcues = {}; self.track_duration = 0
-
     def paintEvent(self, event):
         painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if self.waveform_pixmap: painter.drawPixmap(0, 0, self.waveform_pixmap)
-        if self.is_deck_a:
-            painter.setPen(QPen(QColor("#FF0055"), 4)); painter.drawRect(self.rect().adjusted(2,2,-2,-2))
-            painter.drawText(10, 20, "DECK A")
-        elif self.is_deck_b:
-            painter.setPen(QPen(QColor("#00CCFF"), 4)); painter.drawRect(self.rect().adjusted(2,2,-2,-2))
-            painter.drawText(self.width()-60, 20, "DECK B")
+        if self.is_deck_a: painter.setPen(QPen(QColor("#FF0055"), 4)); painter.drawRect(self.rect().adjusted(2,2,-2,-2)); painter.drawText(10, 20, "DECK A")
+        elif self.is_deck_b: painter.setPen(QPen(QColor("#00CCFF"), 4)); painter.drawRect(self.rect().adjusted(2,2,-2,-2)); painter.drawText(self.width()-60, 20, "DECK B")
         painter.setPen(QColor("white")); font = painter.font(); font.setBold(True); painter.setFont(font)
-        status = " (...)" if self.loading else ""
-        label = f"KEY: {self.key_char.upper()}\n{self.filename}{status}\n{self.bpm_text}"
+        status = " (...)" if self.loading else ""; label = f"KEY: {self.key_char.upper()}\n{self.filename}{status}\n{self.bpm_text}"
         painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, label); painter.end()
-
     def mousePressEvent(self, event):
         if QApplication.keyboardModifiers() == Qt.KeyboardModifier.AltModifier: self.parent_app.assign_to_deck("B", self.key_char)
         elif event.button() == Qt.MouseButton.LeftButton: self.parent_app.assign_to_deck("A", self.key_char)
@@ -714,184 +268,372 @@ class InteractiveWaveform(QLabel):
     def update_playhead(self, ratio): self.playhead_x = int(ratio * self.width()); self.update()
     def set_loading(self): self.loading = True; self.update()
 
-# --- MAIN APP ---
+# ==========================================
+# 3. WIDGETS & DIALOGS
+# ==========================================
+
+class MidiConfigDialog(QDialog):
+    def __init__(self, midi_worker, current_map, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MIDI Configuration"); self.resize(600, 500)
+        self.worker = midi_worker; self.midi_map = current_map; self.learning_row = -1
+        self.worker.message_received.connect(self.on_midi_message)
+        layout = QVBoxLayout(self)
+        dev_row = QHBoxLayout(); dev_row.addWidget(QLabel("MIDI Input Device:"))
+        self.c_dev = QComboBox()
+        try:
+            inputs = mido.get_input_names(); self.c_dev.addItems(inputs)
+            if self.worker.port_name in inputs: self.c_dev.setCurrentText(self.worker.port_name)
+        except: self.c_dev.addItem("No MIDI Backend Found")
+        self.c_dev.currentTextChanged.connect(self.change_device); dev_row.addWidget(self.c_dev); layout.addLayout(dev_row)
+        self.table = QTableWidget(); self.table.setColumnCount(4); self.table.setHorizontalHeaderLabels(["Action", "Type", "Val/Note", "Learn"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch); self.table.verticalHeader().setVisible(False); layout.addWidget(self.table)
+        self.populate_table()
+        btn_close = QPushButton("Done"); btn_close.clicked.connect(self.accept); layout.addWidget(btn_close)
+    def change_device(self, name): self.worker.stop(); self.worker.set_port(name); self.worker.start()
+    def populate_table(self):
+        self.table.setRowCount(0)
+        for action, binding in sorted(self.midi_map.items()):
+            row = self.table.rowCount(); self.table.insertRow(row); self.table.setItem(row, 0, QTableWidgetItem(action))
+            if binding: msg_type = "CC" if binding['type'] == 'control_change' else "NOTE"; val = str(binding['val'])
+            else: msg_type = "-"; val = "-"
+            self.table.setItem(row, 1, QTableWidgetItem(msg_type)); self.table.setItem(row, 2, QTableWidgetItem(val))
+            btn = QPushButton("LEARN"); btn.clicked.connect(lambda _, r=row: self.start_learn(r)); self.table.setCellWidget(row, 3, btn)
+    def start_learn(self, row):
+        for r in range(self.table.rowCount()):
+            w = self.table.cellWidget(r, 3)
+            if w: w.setText("LEARN"); w.setStyleSheet("")
+        self.learning_row = row; btn = self.table.cellWidget(row, 3); btn.setText("WAITING..."); btn.setStyleSheet("background-color: #FF0055; color: white;")
+    def on_midi_message(self, msg):
+        if self.learning_row == -1 or msg.type not in ['note_on', 'control_change']: return
+        action_name = self.table.item(self.learning_row, 0).text()
+        binding = {'type': msg.type, 'val': msg.control if msg.type == 'control_change' else msg.note, 'channel': msg.channel}
+        self.midi_map[action_name] = binding; self.learning_row = -1; self.populate_table()
+
+class HotkeyEditor(QDialog):
+    def __init__(self, current_bindings, parent=None):
+        super().__init__(parent); self.setWindowTitle("Hotkey Manager"); self.resize(400, 500)
+        self.bindings = current_bindings.copy(); self.waiting_for_key = None
+        layout = QVBoxLayout(self); self.lbl_info = QLabel("Double-click a row to rebind."); layout.addWidget(self.lbl_info)
+        self.table = QTableWidget(); self.table.setColumnCount(2); self.table.setHorizontalHeaderLabels(["Action", "Key"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.cellDoubleClicked.connect(self.start_rebinding); layout.addWidget(self.table); self.populate_table()
+        btn_box = QHBoxLayout(); btn_save = QPushButton("Save & Close"); btn_save.clicked.connect(self.accept)
+        btn_cancel = QPushButton("Cancel"); btn_cancel.clicked.connect(self.reject); btn_box.addWidget(btn_cancel); btn_box.addWidget(btn_save); layout.addLayout(btn_box)
+    def populate_table(self):
+        self.table.setRowCount(len(self.bindings))
+        for i, (action, key_code) in enumerate(self.bindings.items()):
+            self.table.setItem(i, 0, QTableWidgetItem(action.replace("_", " "))); key_name = QKeySequence(key_code).toString(); 
+            if key_code == Qt.Key.Key_Space: key_name = "Space"
+            self.table.setItem(i, 1, QTableWidgetItem(key_name))
+    def start_rebinding(self, row, col):
+        self.waiting_for_key = self.table.item(row, 0).text().replace(" ", "_"); self.lbl_info.setText(f"Press key for: {self.waiting_for_key}..."); self.lbl_info.setStyleSheet("color: #00CCFF; font-weight: bold;"); self.table.setEnabled(False); self.setFocus()
+    def keyPressEvent(self, event):
+        if self.waiting_for_key:
+            self.bindings[self.waiting_for_key] = event.key(); self.waiting_for_key = None; self.lbl_info.setText("Double-click a row to rebind."); self.lbl_info.setStyleSheet(""); self.table.setEnabled(True); self.populate_table()
+        else: super().keyPressEvent(event)
+    def get_bindings(self): return self.bindings
+
+class LoopBar(QWidget):
+    def __init__(self, parent_sequencer):
+        super().__init__(); self.sequencer = parent_sequencer; self.setFixedHeight(30); self.setStyleSheet("background-color: #1a1a1a; border-bottom: 1px solid #333;")
+        self.setMouseTracking(True); self.dragging = False; self.drag_start_x = 0; self.start_step_cache = 0
+    def paintEvent(self, event):
+        painter = QPainter(self); w = self.width(); h = self.height(); step_w = w / 64.0; painter.fillRect(self.rect(), QColor("#111"))
+        start_x = self.sequencer.loop_start * step_w; loop_w = self.sequencer.loop_length * step_w
+        bar_rect = QRectF(start_x, 2, loop_w, h - 4); painter.setBrush(QColor("#00CCFF")); painter.setPen(Qt.PenStyle.NoPen); painter.drawRoundedRect(bar_rect, 4, 4)
+        painter.setPen(QColor("black")); painter.setFont(QFont("Arial", 10, QFont.Weight.Bold)); label = f"{self.sequencer.loop_length} STEPS"; painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, label)
+    def mousePressEvent(self, event):
+        step_w = self.width() / 64.0; start_x = self.sequencer.loop_start * step_w; loop_w = self.sequencer.loop_length * step_w; bar_rect = QRectF(start_x, 0, loop_w, self.height())
+        if bar_rect.contains(event.position()): self.dragging = True; self.drag_start_x = event.position().x(); self.start_step_cache = self.sequencer.loop_start; self.setCursor(Qt.CursorShape.SizeHorCursor)
+        else:
+            new_start = int(event.position().x() / step_w) - (self.sequencer.loop_length // 2); self.sequencer.set_loop_window(new_start, self.sequencer.loop_length); self.update()
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            delta_steps = int((event.position().x() - self.drag_start_x) / (self.width() / 64.0)); self.sequencer.set_loop_window(self.start_step_cache + delta_steps, self.sequencer.loop_length); self.update()
+    def mouseReleaseEvent(self, event): self.dragging = False; self.setCursor(Qt.CursorShape.ArrowCursor)
+
+class PianoRollSequencer(QWidget):
+    def __init__(self, parent_app):
+        super().__init__(); self.parent_app = parent_app; self.setMinimumHeight(300); self.setStyleSheet("background-color: #080808; border: 2px solid #333; margin-top: 0px; border-radius: 0px 0px 4px 4px;")
+        self.points = {}; self.selection = set(); self.current_step = 0; self.steps = 64; self.loop_start = 0; self.loop_length = 64
+        self.mode = "IDLE"; self.drag_start_pos = QPointF(); self.last_mouse_pos = QPointF(); self.marquee_rect = QRectF(); self.move_snapshot = {}; self.clean_slate_points = {}
+        self.undo_stack = []; self.redo_stack = []; self.state_at_press = {}; self.setMouseTracking(True); self.setFocusPolicy(Qt.FocusPolicy.ClickFocus) 
+    def quantize_selection(self, grid=4):
+        if not self.selection: return
+        self.push_to_undo(self.points.copy()); new_points = self.points.copy(); new_selection = set(); moves = []
+        for step in list(self.selection):
+            if step in new_points: target = max(0, min(round(step / grid) * grid, 63)); moves.append((step, target, new_points[step]))
+        for o, n, v in moves: 
+            if o in new_points: del new_points[o]
+        for o, n, v in moves: new_points[n] = v; new_selection.add(n)
+        self.points = new_points; self.selection = new_selection; self.update(); self.parent_app.save_curve_data()
+    def push_to_undo(self, state):
+        self.undo_stack.append(state); 
+        if len(self.undo_stack) > 50: self.undo_stack.pop(0)
+        self.redo_stack.clear()
+    def perform_undo(self):
+        if not self.undo_stack: return
+        self.redo_stack.append(self.points.copy()); self.points = self.undo_stack.pop(); self.selection.clear(); self.update(); self.parent_app.save_curve_data()
+    def perform_redo(self):
+        if not self.redo_stack: return
+        self.undo_stack.append(self.points.copy()); self.points = self.redo_stack.pop(); self.selection.clear(); self.update(); self.parent_app.save_curve_data()
+    def set_loop_window(self, start, length):
+        self.loop_length = length; self.loop_start = max(0, min(start, 64 - length)); self.update()
+        if hasattr(self.parent_app, 'loop_bar'): self.parent_app.loop_bar.update()
+    def set_data(self, data): self.points = data.copy() if data else {}; self.selection.clear(); self.undo_stack.clear(); self.redo_stack.clear(); self.update()
+    def get_data(self): return self.points
+    def get_step_from_x(self, x): return max(0, min(int(x / (self.width()/self.steps)), self.steps - 1))
+    def get_val_from_y(self, y): return max(0.0, min(1.0 - (y / self.height()), 1.0))
+    def get_rect_for_note(self, step, val):
+        step_w = self.width() / self.steps; block_h = 20; y = int(self.height() - (val * self.height())) - 10; y = max(0, min(y, self.height() - 20))
+        return QRectF(int(step * step_w), y, step_w, block_h)
+    
+    def keyPressEvent(self, event):
+        k = event.key(); keys = self.parent_app.key_bindings
+        if k == Qt.Key.Key_Up or k == Qt.Key.Key_Down:
+            if not self.selection: event.ignore(); super().keyPressEvent(event); return 
+            self.push_to_undo(self.points.copy())
+            increment = 0.01 if k == Qt.Key.Key_Up else -0.01
+            for step in self.selection:
+                if step in self.points: self.points[step] = max(0.0, min(1.0, self.points[step] + increment))
+            self.update(); self.parent_app.save_curve_data(); event.accept(); return
+        if k == Qt.Key.Key_Left or k == Qt.Key.Key_Right:
+            if not self.selection: event.ignore(); super().keyPressEvent(event); return 
+            delta = -1 if k == Qt.Key.Key_Left else 1
+            min_s = min(self.selection); max_s = max(self.selection)
+            if (min_s + delta < 0) or (max_s + delta > 63): return 
+            self.push_to_undo(self.points.copy()); new_points = self.points.copy(); [new_points.pop(s, None) for s in self.selection]; new_sel = set()
+            for s in self.selection: new_points[s+delta] = self.points[s]; new_sel.add(s+delta)
+            self.points = new_points; self.selection = new_sel; self.update(); self.parent_app.save_curve_data(); event.accept(); return
+        if k == keys.get("QUANTIZE", Qt.Key.Key_Q): self.quantize_selection(); return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and k == Qt.Key.Key_Z:
+            self.perform_redo() if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else self.perform_undo(); return
+        if k in [Qt.Key.Key_Delete, Qt.Key.Key_Backspace]:
+            self.push_to_undo(self.points.copy())
+            for step in list(self.selection):
+                if step in self.points: del self.points[step]
+            self.selection.clear(); self.update(); self.parent_app.save_curve_data()
+        else: super().keyPressEvent(event)
+
+    def erase_at_pos(self, pos):
+        step = self.get_step_from_x(pos.x())
+        if step in self.points and self.get_rect_for_note(step, self.points[step]).adjusted(-5,-20,5,20).contains(pos):
+            del self.points[step]; self.selection.discard(step); self.update()
+    def interpolate_erase(self, p1, p2):
+        steps = int(math.hypot(p2.x()-p1.x(), p2.y()-p1.y()) / 5) + 1 
+        for i in range(steps + 1): t = i / steps; self.erase_at_pos(QPointF(p1.x() + (p2.x()-p1.x())*t, p1.y() + (p2.y()-p1.y())*t))
+    def mousePressEvent(self, event):
+        self.setFocus(); self.state_at_press = self.points.copy(); pos = event.position(); self.last_mouse_pos = pos; step = self.get_step_from_x(pos.x())
+        if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) or (event.button() == Qt.MouseButton.RightButton):
+            self.mode = "ERASING"; self.setCursor(Qt.CursorShape.ForbiddenCursor); self.erase_at_pos(pos); return
+        clicked = -1
+        for s, v in self.points.items():
+            if self.get_rect_for_note(s, v).adjusted(-2,-5,2,5).contains(pos): clicked = s; break
+        if clicked != -1:
+            if clicked not in self.selection:
+                if not (QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier): self.selection.clear()
+                self.selection.add(clicked)
+            self.mode = "MOVING"; self.drag_start_pos = pos; self.move_snapshot = {s: self.points[s] for s in self.selection}
+            if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier: self.clean_slate_points = self.points.copy(); self.setCursor(Qt.CursorShape.DragCopyCursor)
+            else: self.clean_slate_points = self.points.copy(); [self.clean_slate_points.pop(s, None) for s in self.selection]; self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.points = self.clean_slate_points.copy()
+        else:
+            if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier: self.mode = "SELECTING"; self.drag_start_pos = pos; self.marquee_rect = QRectF(pos, pos)
+            else:
+                if self.selection: self.selection.clear(); self.mode = "IDLE"
+                else: self.selection.clear(); self.mode = "DRAWING"; self.points[step] = self.get_val_from_y(pos.y()); self.selection.add(step); self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self.mode == "ERASING": self.interpolate_erase(self.last_mouse_pos, pos)
+        elif self.mode == "SELECTING":
+            self.marquee_rect = QRectF(self.dragged_rect(self.drag_start_pos, pos)); self.selection.clear()
+            for s, v in self.points.items():
+                if self.marquee_rect.intersects(self.get_rect_for_note(s, v)): self.selection.add(s)
+            self.update()
+        elif self.mode == "MOVING":
+            d_s = int((pos.x()-self.drag_start_pos.x())/(self.width()/64)); d_v = -(pos.y()-self.drag_start_pos.y())/self.height()
+            self.points = self.clean_slate_points.copy(); new_sel = set()
+            for os, ov in self.move_snapshot.items():
+                ns = os + d_s; nv = max(0.0, min(ov + d_v, 1.0))
+                if 0 <= ns < 64: self.points[ns] = nv; new_sel.add(ns)
+            self.selection = new_sel; self.update()
+        elif self.mode == "DRAWING": self.points[self.get_step_from_x(pos.x())] = self.get_val_from_y(pos.y()); self.update()
+        else:
+            step = self.get_step_from_x(pos.x()); hover = False
+            for s, v in self.points.items():
+                if s == step and self.get_rect_for_note(s, v).contains(pos): hover = True; break
+            self.setCursor(Qt.CursorShape.OpenHandCursor if hover else Qt.CursorShape.ArrowCursor)
+        self.last_mouse_pos = pos
+    def mouseReleaseEvent(self, event):
+        if self.points != self.state_at_press: self.push_to_undo(self.state_at_press)
+        self.mode = "IDLE"; self.marquee_rect = QRectF(); self.setCursor(Qt.CursorShape.ArrowCursor); self.parent_app.save_curve_data(); self.update()
+    def dragged_rect(self, p1, p2): return QRectF(p1, p2).normalized()
+    def paintEvent(self, event):
+        painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing, False); w = self.width(); h = self.height(); step_w = w / 64
+        painter.fillRect(self.rect(), QColor("#080808")); lx = int(self.loop_start * step_w); lw = int(self.loop_length * step_w)
+        painter.fillRect(0, 0, lx, h, QColor(0,0,0,180)); painter.fillRect(lx+lw, 0, w-(lx+lw), h, QColor(0,0,0,180))
+        painter.setPen(QPen(QColor(40,40,40), 1)); [painter.drawLine(int(i*step_w),0,int(i*step_w),h) for i in range(0,64,4)]
+        painter.setPen(QPen(QColor(30,30,30), 1)); [painter.drawLine(0,int(i*(h/5)),w,int(i*(h/5))) for i in range(1,5)]
+        painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(255,255,255,30)); painter.drawRect(int(self.current_step*step_w), 0, int(step_w), h)
+        for s, v in self.points.items():
+            in_loop = self.loop_start <= s < (self.loop_start + self.loop_length)
+            painter.setBrush(QColor("#FFFFFF") if s in self.selection else (QColor("#00CCFF") if in_loop else QColor("#004455")))
+            rect = self.get_rect_for_note(s, v); painter.drawRect(rect)
+            painter.setPen(QPen(QColor(0,204,255,60) if in_loop else QColor(0,50,60,40), 1))
+            painter.drawLine(int(rect.center().x()), int(rect.bottom()), int(rect.center().x()), h); painter.setPen(Qt.PenStyle.NoPen)
+        if self.mode == "SELECTING": painter.setPen(QPen(QColor(255,255,255),1,Qt.PenStyle.DashLine)); painter.setBrush(QColor(255,255,255,30)); painter.drawRect(self.marquee_rect)
+
+# ==========================================
+# 4. MAIN APPLICATION
+# ==========================================
+
 class LooperApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VJ Piano Roll Sequencer v16.0 (Quantize)")
+        self.setWindowTitle("VJ Piano Roll Sequencer v21.0 (Per-Clip Settings)")
         self.resize(800, 1000)
         QApplication.instance().setStyleSheet(DARK_THEME)
 
-        self.projector = QWidget(); self.projector.resize(800,600); self.projector.setStyleSheet("background:black")
-        self.proj_scene = QGraphicsScene(0, 0, 800, 600)
-        self.proj_view = QGraphicsView(self.projector)
-        self.proj_view.setViewport(QOpenGLWidget()); self.proj_view.resize(800,600)
-        self.proj_view.setScene(self.proj_scene)
-        self.proj_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.proj_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.key_bindings = { "PLAY_PAUSE": Qt.Key.Key_Space, "TOGGLE_SEQUENCER": Qt.Key.Key_P, "TAP_TEMPO": Qt.Key.Key_Return, "CROSSFADER_LEFT": Qt.Key.Key_Left, "CROSSFADER_RIGHT": Qt.Key.Key_Right, "BANK_1": Qt.Key.Key_5, "BANK_2": Qt.Key.Key_6, "BANK_3": Qt.Key.Key_7, "QUANTIZE": Qt.Key.Key_Q }
+        self.midi_map = { "CROSSFADER": {'type': 'control_change', 'val': 1, 'channel': 0}, "PLAY_PAUSE": None, "TOGGLE_SEQUENCER": None, "TAP_TEMPO": None, "TRIGGER_A": None, "TRIGGER_S": None, "TRIGGER_D": None, "TRIGGER_F": None }
         
-        self.deck_a_item = QGraphicsVideoItem(); self.deck_b_item = QGraphicsVideoItem()
-        self.proj_scene.addItem(self.deck_a_item); self.proj_scene.addItem(self.deck_b_item)
-        self.deck_b_item.setZValue(1)
+        self.midi_worker = MidiWorker(); self.midi_worker.message_received.connect(self.handle_midi_message); self.midi_worker.start()
+
+        self.projector = QWidget(); self.projector.resize(800,600); self.projector.setStyleSheet("background:black")
+        self.proj_scene = QGraphicsScene(0,0,800,600); self.proj_view = QGraphicsView(self.projector); self.proj_view.setViewport(QOpenGLWidget()); self.proj_view.resize(800,600); self.proj_view.setScene(self.proj_scene)
+        self.proj_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.proj_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.deck_a_item = QGraphicsVideoItem(); self.deck_b_item = QGraphicsVideoItem(); self.proj_scene.addItem(self.deck_a_item); self.proj_scene.addItem(self.deck_b_item); self.deck_b_item.setZValue(1)
         self.projector.show()
 
-        self.deck_a = VJDeck("A", self.deck_a_item)
-        self.deck_b = VJDeck("B", self.deck_b_item)
-        self.deck_a.player.positionChanged.connect(self.on_deck_a_pos)
-        self.deck_b.player.positionChanged.connect(self.on_deck_b_pos)
+        self.deck_a = VJDeck("A", self.deck_a_item); self.deck_b = VJDeck("B", self.deck_b_item)
+        self.deck_a.player.positionChanged.connect(self.on_deck_a_pos); self.deck_b.player.positionChanged.connect(self.on_deck_b_pos)
 
-        self.buttons = {}; self.bank_data = {0: {}, 1: {}, 2: {}} 
-        self.clip_meta = {}; self.hotcue_data = {}; self.clip_curves = {}
-        self.active_clip_a = None; self.active_clip_b = None
-        self.current_bank = 0; self.current_generation = 0; self.active_workers = []
-        self.crossfader_value = 0.0; self.master_bpm = 120.0; self.tap_times = []
-        self.transport_start_time = time.time()
-        
-        self.seq_running = False; self.current_step = 0
-        self.seq_multiplier = 1.0; self.seq_timer = QTimer(); self.seq_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.seq_timer.timeout.connect(self.run_sequencer_step)
+        self.buttons = {}; self.bank_data = {0: {}, 1: {}, 2: {}}; self.clip_meta = {}; self.clip_curves = {}; self.clip_loops = {}; self.active_clip_a = None; self.active_clip_b = None
+        self.current_bank = 0; self.current_generation = 0; self.active_workers = []; self.crossfader_value = 0.0; self.master_bpm = 120.0; self.tap_times = []; self.transport_start_time = time.time()
+        self.seq_running = False; self.current_step = 0; self.seq_multiplier = 1.0; self.seq_timer = QTimer(); self.seq_timer.setTimerType(Qt.TimerType.PreciseTimer); self.seq_timer.timeout.connect(self.run_sequencer_step)
 
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); self.setCentralWidget(scroll)
-        w = QWidget(); w.setObjectName("Container"); scroll.setWidget(w); l = QVBoxLayout(w); l.setSpacing(10)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); self.setCentralWidget(scroll); w = QWidget(); w.setObjectName("Container"); scroll.setWidget(w); l = QVBoxLayout(w); l.setSpacing(10)
 
-        # Top Bar
         top = QHBoxLayout()
         btn_s = QPushButton("SAVE"); btn_s.clicked.connect(self.save_set)
         btn_l = QPushButton("LOAD"); btn_l.clicked.connect(self.load_set)
-        
+        btn_keys = QPushButton("KEYS"); btn_keys.clicked.connect(self.open_hotkey_editor)
+        btn_midi = QPushButton("MIDI"); btn_midi.clicked.connect(self.open_midi_editor)
         self.btn_vid_sync = QPushButton("VID SYNC: ON"); self.btn_vid_sync.setCheckable(True); self.btn_vid_sync.setChecked(True); self.btn_vid_sync.setProperty("sync","true"); self.btn_vid_sync.clicked.connect(self.toggle_vid_sync)
         self.btn_align = QPushButton("AUTO-ALIGN"); self.btn_align.clicked.connect(self.auto_align_phase)
-        top.addWidget(btn_s); top.addWidget(btn_l); top.addWidget(self.btn_vid_sync); top.addWidget(self.btn_align)
-        l.addLayout(top)
+        top.addWidget(btn_s); top.addWidget(btn_l); top.addWidget(btn_keys); top.addWidget(btn_midi); top.addWidget(self.btn_vid_sync); top.addWidget(self.btn_align); l.addLayout(top)
 
-        # Audio I/O
-        io = QHBoxLayout()
-        devs = QMediaDevices.audioOutputs()
-        self.c_main = QComboBox(); self.c_cue = QComboBox()
+        io = QHBoxLayout(); devs = QMediaDevices.audioOutputs(); self.c_main = QComboBox(); self.c_cue = QComboBox()
         for d in devs: self.c_main.addItem(d.description()); self.c_cue.addItem(d.description())
-        self.c_main.currentIndexChanged.connect(self.change_main_output)
-        self.c_cue.currentIndexChanged.connect(self.change_cue_output)
-        io.addWidget(QLabel("MAIN:")); io.addWidget(self.c_main); io.addWidget(QLabel("CUE:")); io.addWidget(self.c_cue)
-        l.addLayout(io)
+        self.c_main.currentIndexChanged.connect(self.change_main_output); self.c_cue.currentIndexChanged.connect(self.change_cue_output)
+        io.addWidget(QLabel("MAIN:")); io.addWidget(self.c_main); io.addWidget(QLabel("CUE:")); io.addWidget(self.c_cue); l.addLayout(io)
 
-        # Bank
-        bank_row = QHBoxLayout()
-        self.bank_btns = []
+        # Loop Controls Row
+        loop_controls = QHBoxLayout()
+        
+        # Deck A Loop
+        self.chk_loop_a = QCheckBox("LOOP A"); self.chk_loop_a.setChecked(True)
+        self.chk_loop_a.toggled.connect(self.toggle_loop_a)
+        loop_controls.addWidget(self.chk_loop_a)
+        
+        loop_controls.addStretch()
+        
+        # Deck B Loop
+        self.chk_loop_b = QCheckBox("LOOP B"); self.chk_loop_b.setChecked(True)
+        self.chk_loop_b.toggled.connect(self.toggle_loop_b)
+        loop_controls.addWidget(self.chk_loop_b)
+        
+        l.addLayout(loop_controls)
+
+        bank_row = QHBoxLayout(); self.bank_btns = []
         for i in range(3):
-            b = QPushButton(f"BANK {i+1}"); b.setCheckable(True); b.clicked.connect(lambda _, x=i: self.switch_bank(x))
-            bank_row.addWidget(b); self.bank_btns.append(b)
+            b = QPushButton(f"BANK {i+1}"); b.setCheckable(True); b.clicked.connect(lambda _, x=i: self.switch_bank(x)); bank_row.addWidget(b); self.bank_btns.append(b)
         self.bank_btns[0].setChecked(True); l.addLayout(bank_row)
 
-        # Pads
         g = QGridLayout()
         for k, (r,c,col) in KEY_MAP.items():
             b = InteractiveWaveform(k, col, self); self.buttons[k] = b; g.addWidget(b, r, c)
         l.addLayout(g)
 
-        # XFader
-        l.addWidget(QLabel("CROSSFADER (Left/Right Arrows)"))
-        self.fader = QSlider(Qt.Orientation.Horizontal); self.fader.setRange(0,100); self.fader.valueChanged.connect(self.on_fader_ui_changed); l.addWidget(self.fader)
+        l.addWidget(QLabel("CROSSFADER (Arrows)")); self.fader = QSlider(Qt.Orientation.Horizontal); self.fader.setRange(0,100); self.fader.valueChanged.connect(self.on_fader_ui_changed); l.addWidget(self.fader)
 
-        # BPM
-        bpm_row = QHBoxLayout()
-        self.bpm_lbl = QLabel("120.0 BPM")
+        bpm_row = QHBoxLayout(); self.bpm_lbl = QLabel("120.0 BPM")
         btn_nudge_down = QPushButton("-"); btn_nudge_down.setProperty("nudge", "true"); btn_nudge_down.clicked.connect(lambda: self.nudge_bpm(-0.1))
         btn_nudge_up = QPushButton("+"); btn_nudge_up.setProperty("nudge", "true"); btn_nudge_up.clicked.connect(lambda: self.nudge_bpm(0.1))
-        self.c_speed = QComboBox(); self.c_speed.addItems(["1/2x", "1x", "2x"]); self.c_speed.setCurrentIndex(1)
-        self.c_speed.currentIndexChanged.connect(self.change_seq_speed)
+        self.c_speed = QComboBox(); self.c_speed.addItems(["1/2x", "1x", "2x"]); self.c_speed.setCurrentIndex(1); self.c_speed.currentIndexChanged.connect(self.change_seq_speed)
         btn_tap = QPushButton("TAP"); btn_tap.clicked.connect(self.handle_tap_tempo)
-        bpm_row.addWidget(btn_nudge_down); bpm_row.addWidget(self.bpm_lbl); bpm_row.addWidget(btn_nudge_up)
-        bpm_row.addWidget(QLabel("SEQ RATE:")); bpm_row.addWidget(self.c_speed); bpm_row.addWidget(btn_tap); l.addLayout(bpm_row)
+        bpm_row.addWidget(btn_nudge_down); bpm_row.addWidget(self.bpm_lbl); bpm_row.addWidget(btn_nudge_up); bpm_row.addWidget(QLabel("SEQ RATE:")); bpm_row.addWidget(self.c_speed); bpm_row.addWidget(btn_tap); l.addLayout(bpm_row)
 
-        # LOOP BAR CONTROLS
-        l.addWidget(QLabel("LOOP LENGTH:"))
-        loop_size_row = QHBoxLayout()
-        self.loop_btns = QButtonGroup()
+        l.addWidget(QLabel("LOOP LENGTH:")); loop_size_row = QHBoxLayout(); self.loop_btns = QButtonGroup()
         for s in [4, 8, 16, 32, 64]:
-            b = QPushButton(str(s)); b.setCheckable(True); b.setProperty("loop", "true")
+            b = QPushButton(str(s)); b.setCheckable(True); b.setProperty("loop", "true"); 
             if s == 64: b.setChecked(True)
-            b.clicked.connect(lambda _, size=s: self.set_loop_length(size))
-            self.loop_btns.addButton(b, s)
-            loop_size_row.addWidget(b)
+            b.clicked.connect(lambda _, size=s: self.set_loop_length(size)); self.loop_btns.addButton(b, s); loop_size_row.addWidget(b)
         loop_size_row.addStretch(); l.addLayout(loop_size_row)
 
-        # PIANO ROLL
         cur_tools = QHBoxLayout()
         self.rad_a = QRadioButton("EDIT A"); self.rad_a.setChecked(True); self.rad_a.toggled.connect(self.update_curve_ui)
         self.rad_b = QRadioButton("EDIT B"); self.rad_b.toggled.connect(self.update_curve_ui)
-        
-        # New Quantize Button
-        btn_quant = QPushButton("QUANTIZE (Q)")
-        btn_quant.clicked.connect(lambda: self.piano_roll.quantize_selection())
-        
+        btn_quant = QPushButton("QUANTIZE (Q)"); btn_quant.clicked.connect(lambda: self.piano_roll.quantize_selection())
         self.btn_run = QPushButton("RUN SEQ (P)"); self.btn_run.setCheckable(True); self.btn_run.clicked.connect(self.toggle_sequencer)
-        
-        cur_tools.addWidget(self.rad_a); cur_tools.addWidget(self.rad_b); 
-        cur_tools.addWidget(btn_quant); cur_tools.addWidget(self.btn_run)
-        l.addLayout(cur_tools)
+        cur_tools.addWidget(self.rad_a); cur_tools.addWidget(self.rad_b); cur_tools.addWidget(btn_quant); cur_tools.addWidget(self.btn_run); l.addLayout(cur_tools)
 
-        self.piano_roll = PianoRollSequencer(self)
-        self.loop_bar = LoopBar(self.piano_roll)
-        
-        l.addWidget(self.loop_bar)
-        l.addWidget(self.piano_roll)
+        self.piano_roll = PianoRollSequencer(self); self.loop_bar = LoopBar(self.piano_roll)
+        l.addWidget(self.loop_bar); l.addWidget(self.piano_roll)
 
         self.reopen_btn = QPushButton("OPEN PROJECTOR WINDOW"); self.reopen_btn.clicked.connect(self.projector.show); l.addWidget(self.reopen_btn)
-        
-        QApplication.instance().installEventFilter(self)
-        self.update_mixer()
+        QApplication.instance().installEventFilter(self); self.update_mixer()
 
-    def set_loop_length(self, length):
-        self.piano_roll.set_loop_window(self.piano_roll.loop_start, length)
+    def toggle_loop_a(self, state):
+        self.deck_a.set_loop_mode(state)
+        if self.deck_a.current_filepath: self.clip_loops[self.deck_a.current_filepath] = state
+    def toggle_loop_b(self, state):
+        self.deck_b.set_loop_mode(state)
+        if self.deck_b.current_filepath: self.clip_loops[self.deck_b.current_filepath] = state
 
+    def open_hotkey_editor(self):
+        editor = HotkeyEditor(self.key_bindings, self)
+        if editor.exec() == QDialog.DialogCode.Accepted: self.key_bindings = editor.get_bindings()
+    def open_midi_editor(self):
+        editor = MidiConfigDialog(self.midi_worker, self.midi_map, self); editor.exec()
+    def handle_midi_message(self, msg):
+        for action, binding in self.midi_map.items():
+            if not binding: continue
+            is_match = (msg.type == binding['type'] and (msg.control if msg.type == 'control_change' else msg.note) == binding['val'])
+            if is_match:
+                if action == "CROSSFADER": self.fader.setValue(int((msg.value / 127.0) * 100))
+                elif action == "PLAY_PAUSE" and msg.type == 'note_on' and msg.velocity > 0: self.toggle_play_state()
+                elif action == "TOGGLE_SEQUENCER" and msg.type == 'note_on' and msg.velocity > 0: self.toggle_sequencer()
+                elif action == "TAP_TEMPO" and msg.type == 'note_on' and msg.velocity > 0: self.handle_tap_tempo()
+                elif action.startswith("TRIGGER_") and msg.type == 'note_on' and msg.velocity > 0:
+                    key_char = action.split("_")[1].lower()
+                    if key_char in self.buttons: self.assign_to_deck("B" if self.rad_b.isChecked() else "A", key_char)
+    def toggle_play_state(self):
+        if self.deck_a.has_media(): self.deck_a.play() if self.deck_a.playbackState()!=QMediaPlayer.PlaybackState.PlayingState else self.deck_a.pause()
+        if self.deck_b.has_media(): self.deck_b.play() if self.deck_b.playbackState()!=QMediaPlayer.PlaybackState.PlayingState else self.deck_b.pause()
+    def set_loop_length(self, length): self.piano_roll.set_loop_window(self.piano_roll.loop_start, length)
     def nudge_bpm(self, amount):
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier: amount *= 10
-        self.master_bpm = round(max(10.0, self.master_bpm + amount), 1)
-        self.bpm_lbl.setText(f"{self.master_bpm} BPM")
+        self.master_bpm = round(max(10.0, self.master_bpm + amount), 1); self.bpm_lbl.setText(f"{self.master_bpm} BPM")
         if self.btn_vid_sync.isChecked(): self.sync_deck(self.deck_a, self.active_clip_a); self.sync_deck(self.deck_b, self.active_clip_b)
         self.update_clock()
-
     def get_target_deck_info(self): return (self.deck_a, self.deck_a.current_filepath) if self.rad_a.isChecked() else (self.deck_b, self.deck_b.current_filepath)
-    def update_curve_ui(self):
-        _, path = self.get_target_deck_info()
-        self.piano_roll.set_data(self.clip_curves.get(path, {}))
-    def save_curve_data(self):
-        _, path = self.get_target_deck_info()
-        if path: self.clip_curves[path] = self.piano_roll.get_data()
-
+    def update_curve_ui(self): _, path = self.get_target_deck_info(); self.piano_roll.set_data(self.clip_curves.get(path, {}))
+    def save_curve_data(self): _, path = self.get_target_deck_info(); self.clip_curves[path] = self.piano_roll.get_data() if path else None
     def run_sequencer_step(self):
-        # Loop Logic
-        ls = self.piano_roll.loop_start
-        ll = self.piano_roll.loop_length
-        self.current_step = ls + ((self.current_step + 1 - ls) % ll)
-        
-        self.piano_roll.current_step = self.current_step; self.piano_roll.update()
-        
-        path_a = self.deck_a.current_filepath
-        if path_a and path_a in self.clip_curves and self.current_step in self.clip_curves[path_a]:
-            val = self.clip_curves[path_a][self.current_step]; dur = self.deck_a.duration()
-            if dur > 0: self.deck_a.trigger(int(val * dur))
-        path_b = self.deck_b.current_filepath
-        if path_b and path_b in self.clip_curves and self.current_step in self.clip_curves[path_b]:
-            val = self.clip_curves[path_b][self.current_step]; dur = self.deck_b.duration()
-            if dur > 0: self.deck_b.trigger(int(val * dur))
-
+        ls = self.piano_roll.loop_start; ll = self.piano_roll.loop_length; self.current_step = ls + ((self.current_step + 1 - ls) % ll); self.piano_roll.current_step = self.current_step; self.piano_roll.update()
+        for d, path in [(self.deck_a, self.deck_a.current_filepath), (self.deck_b, self.deck_b.current_filepath)]:
+            if path and path in self.clip_curves and self.current_step in self.clip_curves[path]: d.trigger(int(self.clip_curves[path][self.current_step] * d.duration()))
     def toggle_sequencer(self):
-        self.seq_running = not self.seq_running
-        self.btn_run.setChecked(self.seq_running)
-        if self.seq_running: self.update_clock()
-        else: self.seq_timer.stop()
-
+        self.seq_running = not self.seq_running; self.btn_run.setChecked(self.seq_running)
+        self.update_clock() if self.seq_running else self.seq_timer.stop()
     def update_clock(self):
-        if self.master_bpm <= 0: return
-        interval = ((60000.0 / self.master_bpm) / 4) / self.seq_multiplier
-        self.seq_timer.setInterval(int(interval))
+        if self.master_bpm > 0: self.seq_timer.setInterval(int(((60000.0 / self.master_bpm) / 4) / self.seq_multiplier)); 
         if self.seq_running and not self.seq_timer.isActive(): self.seq_timer.start()
-
-    def change_seq_speed(self, i):
-        self.seq_multiplier = [0.5, 1.0, 2.0][i]
-        self.update_clock()
-
+    def change_seq_speed(self, i): self.seq_multiplier = [0.5, 1.0, 2.0][i]; self.update_clock()
     def handle_tap_tempo(self):
         now = time.time(); self.tap_times.append(now)
         if len(self.tap_times)>4: self.tap_times.pop(0)
@@ -900,30 +642,17 @@ class LooperApp(QMainWindow):
             self.master_bpm = round(60.0/avg, 1); self.bpm_lbl.setText(f"{self.master_bpm} BPM")
             if self.btn_vid_sync.isChecked(): self.sync_deck(self.deck_a, self.active_clip_a); self.sync_deck(self.deck_b, self.active_clip_b)
             self.update_clock()
-
     def sync_deck(self, deck, key):
-        path = self.bank_data[self.current_bank].get(key)
-        if not path: return
-        cb = self.clip_meta.get(path, 120.0)
-        rate = self.master_bpm / cb if cb > 0 else 1.0
-        deck.setPlaybackRate(rate)
-        if deck.base_wav_path:
-            w = RubberBandWorker(key, deck.base_wav_path, rate)
-            w.finished.connect(lambda k,p,r: deck.swap_audio(p,False)) 
-            self.active_workers.append(w); w.start()
-
+        path = self.bank_data[self.current_bank].get(key); cb = self.clip_meta.get(path, 120.0) if path else 120.0
+        rate = self.master_bpm / cb if cb > 0 else 1.0; deck.setPlaybackRate(rate)
+        if deck.base_wav_path: w = RubberBandWorker(key, deck.base_wav_path, rate); w.finished.connect(lambda k,p,r: deck.swap_audio(p,False)); self.active_workers.append(w); w.start()
     def toggle_vid_sync(self):
-        on = self.btn_vid_sync.isChecked()
-        self.btn_vid_sync.setText(f"VID SYNC: {'ON' if on else 'OFF'}")
+        on = self.btn_vid_sync.isChecked(); self.btn_vid_sync.setText(f"VID SYNC: {'ON' if on else 'OFF'}")
         if on: self.sync_deck(self.deck_a, self.active_clip_a); self.sync_deck(self.deck_b, self.active_clip_b)
         else: self.deck_a.setPlaybackRate(1.0); self.deck_b.setPlaybackRate(1.0)
-
     def assign_clip_to_bank(self, key, path):
-        self.bank_data[self.current_bank][key] = path
-        self.buttons[key].set_loading()
-        w = AudioAnalysisWorker(key, path, 200, 120, self.buttons[key].base_color.name(), self.current_generation)
-        w.finished.connect(self.prep_done); self.active_workers.append(w); w.start()
-
+        self.bank_data[self.current_bank][key] = path; self.buttons[key].set_loading()
+        w = AudioAnalysisWorker(key, path, 200, 120, self.buttons[key].base_color.name(), self.current_generation); w.finished.connect(self.prep_done); self.active_workers.append(w); w.start()
     def prep_done(self, key, pix, bpm, dur, raw, rate, wav):
         path = self.bank_data[self.current_bank].get(key)
         if path:
@@ -931,97 +660,87 @@ class LooperApp(QMainWindow):
             if self.active_clip_a == key: self.deck_a.set_audio_data(raw, rate); self.deck_a.load_base_audio(wav)
             if self.active_clip_b == key: self.deck_b.set_audio_data(raw, rate); self.deck_b.load_base_audio(wav)
         self.buttons[key].set_data(pix, bpm, dur)
-
     def assign_to_deck(self, deck_name, key):
-        path = self.bank_data[self.current_bank].get(key)
+        path = self.bank_data[self.current_bank].get(key); t = self.deck_a if deck_name == "A" else self.deck_b
         if not path: return
-        t = self.deck_a if deck_name == "A" else self.deck_b
         t.load_video(path)
+        
+        # RESTORE CLIP STATE
+        loop_state = self.clip_loops.get(path, True)
+        t.set_loop_mode(loop_state)
+        
+        # Update UI Checkbox without triggering toggle logic
+        cb = self.chk_loop_a if deck_name == "A" else self.chk_loop_b
+        cb.blockSignals(True); cb.setChecked(loop_state); cb.blockSignals(False)
+        
         if deck_name == "A": self.active_clip_a = key
         else: self.active_clip_b = key
-        
-        self.buttons[key].set_loading()
-        w = AudioAnalysisWorker(key, path, 200, 120, self.buttons[key].base_color.name(), self.current_generation)
-        w.finished.connect(self.prep_done); self.active_workers.append(w); w.start()
-        
-        # --- FIXED SCENE INIT ---
-        sz = self.proj_scene.sceneRect().size()
-        if sz.width() == 0: sz = QSizeF(800, 600)
-        t.video_item.setSize(sz)
-        
-        t.video_item.show()
-        
+        self.buttons[key].set_loading(); w = AudioAnalysisWorker(key, path, 200, 120, self.buttons[key].base_color.name(), self.current_generation); w.finished.connect(self.prep_done); self.active_workers.append(w); w.start()
+        sz = self.proj_scene.sceneRect().size(); t.video_item.setSize(sz if sz.width()>0 else QSizeF(800,600)); t.video_item.show()
         for k, b in self.buttons.items():
             if deck_name == "A": b.is_deck_a = (k==key)
             else: b.is_deck_b = (k==key); b.update()
-        
         t.play(); self.update_mixer(); self.update_curve_ui()
-
     def auto_align_phase(self):
-        # Crash Fix: Ensure media loaded
-        if not self.deck_a.has_media() or not self.deck_b.has_media(): return
-        
-        # FIX: Check for 0 BPM
-        if self.master_bpm <= 0: return
-
-        beat_ms = 60000.0/self.master_bpm
-        phase = (time.time() - self.transport_start_time)*1000 % beat_ms
+        if not self.deck_a.has_media() or not self.deck_b.has_media() or self.master_bpm <= 0: return
+        beat_ms = 60000.0/self.master_bpm; phase = (time.time() - self.transport_start_time)*1000 % beat_ms
         for d in [self.deck_a, self.deck_b]:
-            diff = phase - (d.position() % beat_ms)
-            if abs(diff) > beat_ms/2: diff += beat_ms if diff < 0 else -beat_ms
-            d.seek(max(0, int(d.position() + diff)))
-
+            diff = phase - (d.position() % beat_ms); d.seek(max(0, int(d.position() + (diff + beat_ms if diff < -beat_ms/2 else diff - beat_ms if diff > beat_ms/2 else diff))))
     def on_fader_ui_changed(self, v): self.crossfader_value = v/100.0; self.update_mixer()
-    def update_mixer(self):
-        v = self.crossfader_value
-        self.deck_a.set_volume(1.0-v); self.deck_b.set_volume(v)
-        self.deck_a.video_item.setOpacity(1.0-v); self.deck_b.video_item.setOpacity(v)
-
+    def update_mixer(self): v = self.crossfader_value; self.deck_a.set_volume(1.0-v); self.deck_b.set_volume(v); self.deck_a.video_item.setOpacity(1.0-v); self.deck_b.video_item.setOpacity(v)
     def change_main_output(self, i): d = self.audio_devices[i]; self.deck_a.set_main_output(d); self.deck_b.set_main_output(d)
     def change_cue_output(self, i): d = self.audio_devices[i]; self.deck_a.set_cue_output(d); self.deck_b.set_cue_output(d)
-    
     def on_deck_a_pos(self, p): 
         if self.active_clip_a: self.buttons[self.active_clip_a].update_playhead(p/self.deck_a.duration())
     def on_deck_b_pos(self, p):
         if self.active_clip_b: self.buttons[self.active_clip_b].update_playhead(p/self.deck_b.duration())
-
     def switch_bank(self, i):
         self.current_bank = i; self.current_generation += 1
         for b in self.bank_btns: b.setChecked(False)
         self.bank_btns[i].setChecked(True)
-        for k in KEY_MAP: 
-            self.buttons[k].filename = "[Empty]"; self.buttons[k].update()
-            p = self.bank_data[i].get(k)
-            if p: self.assign_clip_to_bank(k, p)
-
+        for k in KEY_MAP: self.buttons[k].filename = "[Empty]"; self.buttons[k].update(); p = self.bank_data[i].get(k); self.assign_clip_to_bank(k, p) if p else None
     def load_set(self):
         f, _ = QFileDialog.getOpenFileName(self, "Load", "", "JSON (*.json)")
         if f: 
-            d = json.load(open(f, 'r'))
-            self.bank_data = d['banks']
-            # SANITIZE: Convert string keys back to integers
-            raw_curves = d.get('curves', {})
-            self.clip_curves = {}
-            for path, points in raw_curves.items():
-                self.clip_curves[path] = {int(k): v for k, v in points.items()}
+            d=json.load(open(f,'r')); self.bank_data=d['banks']
+            self.key_bindings={k:int(v) for k,v in d.get('keys',self.key_bindings).items()}
+            self.midi_map=d.get('midi',self.midi_map)
+            self.clip_curves={path:{int(k):v for k,v in points.items()} for path,points in d.get('curves',{}).items()}
+            self.clip_loops=d.get('loops', {})
             self.switch_bank(0)
-
     def save_set(self):
         f, _ = QFileDialog.getSaveFileName(self, "Save", "", "JSON (*.json)")
-        if f: json.dump({'banks':self.bank_data, 'curves':self.clip_curves}, open(f,'w'))
-
+        if f: json.dump({
+            'banks':self.bank_data, 
+            'curves':self.clip_curves, 
+            'keys':self.key_bindings, 
+            'midi':self.midi_map,
+            'loops':self.clip_loops
+        }, open(f,'w'))
+    
+    # --- GLOBAL EVENT FILTER ---
     def eventFilter(self, src, e):
         if e.type() == QEvent.Type.KeyPress and not e.isAutoRepeat():
-            k = e.key()
-            if k == Qt.Key.Key_Space: 
-                if self.deck_a.has_media(): self.deck_a.play() if self.deck_a.playbackState()!=QMediaPlayer.PlaybackState.PlayingState else self.deck_a.pause()
-                if self.deck_b.has_media(): self.deck_b.play() if self.deck_b.playbackState()!=QMediaPlayer.PlaybackState.PlayingState else self.deck_b.pause()
-                return True
-            if e.text() == 'p': self.toggle_sequencer(); return True
-            if k == Qt.Key.Key_Return: self.handle_tap_tempo(); return True
-            if k == Qt.Key.Key_Left: self.fader.setValue(max(0, self.fader.value()-5)); return True
-            if k == Qt.Key.Key_Right: self.fader.setValue(min(100, self.fader.value()+5)); return True
-            if e.text() in ['5','6','7']: self.switch_bank(int(e.text())-5); return True
+            k = e.key(); keys = self.key_bindings
+            
+            # --- CONFLICT FIX: Check for Piano Roll Focus ---
+            if k == Qt.Key.Key_Left or k == Qt.Key.Key_Right:
+                # If piano roll has focus AND a selection, LET IT PASS (return False)
+                if self.piano_roll.hasFocus() and self.piano_roll.selection:
+                    return False 
+                
+                # Otherwise, handle CROSSFADER
+                if k == keys["CROSSFADER_LEFT"]: self.fader.setValue(max(0, self.fader.value()-5)); return True
+                if k == keys["CROSSFADER_RIGHT"]: self.fader.setValue(min(100, self.fader.value()+5)); return True
+
+            # Standard Keys
+            if k == keys["PLAY_PAUSE"]: self.toggle_play_state(); return True
+            if k == keys["TOGGLE_SEQUENCER"]: self.toggle_sequencer(); return True
+            if k == keys["TAP_TEMPO"]: self.handle_tap_tempo(); return True
+            if k == keys["BANK_1"]: self.switch_bank(0); return True
+            if k == keys["BANK_2"]: self.switch_bank(1); return True
+            if k == keys["BANK_3"]: self.switch_bank(2); return True
+            
         return super().eventFilter(src, e)
 
 if __name__ == "__main__":
