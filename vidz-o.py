@@ -11,9 +11,17 @@ import librosa
 import mido 
 from pydub import AudioSegment
 
+# --- SAFE IMPORT FOR FILTERS ---
+try:
+    from pydub.scipy_effects import low_pass_filter, high_pass_filter
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+    print("WARNING: 'scipy' not found. DJ EQ filters will be disabled. Run 'pip install scipy'")
+
 # --- IMPORTS ---
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, 
-                             QLabel, QVBoxLayout, QPushButton, QSlider,
+                             QLabel, QVBoxLayout, QPushButton, QSlider, QDial,
                              QFileDialog, QHBoxLayout, QComboBox, QScrollArea,
                              QSpinBox, QRadioButton, QButtonGroup, QFrame,
                              QGraphicsView, QGraphicsScene, QDialog, QTableWidget,
@@ -51,6 +59,7 @@ QSlider::sub-page:vertical { background: #444; border-radius: 3px; }
 QSlider::groove:horizontal { border: 1px solid #333; height: 8px; background: #1a1a1a; margin: 2px 0; border-radius: 4px; }
 QSlider::handle:horizontal { background: #00CCFF; border: 1px solid #00CCFF; width: 24px; height: 24px; margin: -9px 0; border-radius: 12px; }
 QSlider::sub-page:horizontal { background: #444; border-radius: 4px; }
+QDial { background-color: #222; }
 QTableWidget { background-color: #1a1a1a; gridline-color: #333; border: 1px solid #444; }
 QHeaderView::section { background-color: #2a2a2a; padding: 4px; border: 1px solid #444; }
 QTableWidget::item:selected { background-color: #00CCFF; color: black; }
@@ -83,7 +92,7 @@ class MidiWorker(QThread):
     def stop(self): self.running = False; self.wait()
 
 class AudioAnalysisWorker(QThread):
-    finished = pyqtSignal(str, QPixmap, float, int, object, int, str)
+    finished = pyqtSignal(str, QPixmap, float, int, object, int, str, str, str)
     def __init__(self, key, filepath, width, height, color_hex, gen_id):
         super().__init__()
         self.key, self.filepath, self.width, self.height = key, filepath, width, height; self.bg_color, self.gen_id = QColor(color_hex), gen_id
@@ -91,17 +100,43 @@ class AudioAnalysisWorker(QThread):
         try:
             if self.isInterruptionRequested(): return
             audio_full = AudioSegment.from_file(self.filepath)
+            
+            # --- HARD BAKED FADES (Prevents Clicking) ---
+            audio_full = audio_full.fade_in(5).fade_out(5)
+
             temp_dir = os.path.join(os.getcwd(), "temp_audio")
             if not os.path.exists(temp_dir): os.makedirs(temp_dir)
             clean_name = os.path.basename(self.filepath).replace(" ", "_")
             wav_path = os.path.join(temp_dir, f"{clean_name}_base.wav")
+            bass_path = os.path.join(temp_dir, f"{clean_name}_bass.wav")
+            treble_path = os.path.join(temp_dir, f"{clean_name}_treble.wav")
+            
             if not os.path.exists(wav_path): audio_full.export(wav_path, format="wav")
+            
+            if not os.path.exists(bass_path) or not os.path.exists(treble_path):
+                if HAS_SCIPY:
+                    try:
+                        bass_audio = low_pass_filter(audio_full, 300)
+                        # Heavier fades on bass stems
+                        bass_audio = bass_audio.fade_in(20).fade_out(20)
+                        
+                        treble_audio = high_pass_filter(audio_full, 300)
+                        treble_audio = treble_audio.fade_in(5).fade_out(5)
+                        
+                        bass_audio.export(bass_path, format="wav")
+                        treble_audio.export(treble_path, format="wav")
+                    except:
+                        shutil.copy(wav_path, bass_path); shutil.copy(wav_path, treble_path)
+                else:
+                    shutil.copy(wav_path, bass_path); shutil.copy(wav_path, treble_path)
+
             duration_ms = len(audio_full); audio_vis = audio_full[:60000] if duration_ms > 60000 else audio_full
             raw_samples = np.array(audio_full.get_array_of_samples())
             sample_rate = audio_full.frame_rate
             vis_samples = np.array(audio_vis.set_channels(1).set_frame_rate(11025).get_array_of_samples())
             tempo, _ = librosa.beat.beat_track(y=vis_samples.astype(np.float32)/32768.0, sr=11025)
             bpm = float(tempo.item()) if isinstance(tempo, np.ndarray) else float(round(tempo, 2))
+            
             draw_samples = vis_samples[::150]
             pixmap = QPixmap(self.width, self.height); pixmap.fill(Qt.GlobalColor.transparent)
             painter = QPainter(pixmap); painter.setPen(QPen(self.bg_color.darker(150), 1)); center_y = self.height / 2; step = len(draw_samples) / self.width
@@ -110,9 +145,9 @@ class AudioAnalysisWorker(QThread):
                 idx = int(x * step)
                 if idx < len(draw_samples): h = abs(draw_samples[idx]) * (self.height * 0.9) / 32768.0; painter.drawLine(x, int(center_y - h/2), x, int(center_y + h/2))
             painter.end()
-            if not self.isInterruptionRequested(): self.finished.emit(self.key, pixmap, bpm, duration_ms, raw_samples, sample_rate, wav_path)
+            if not self.isInterruptionRequested(): self.finished.emit(self.key, pixmap, bpm, duration_ms, raw_samples, sample_rate, wav_path, bass_path, treble_path)
         except:
-            if not self.isInterruptionRequested(): self.finished.emit(self.key, QPixmap(), 120.0, 0, None, 44100, "")
+            if not self.isInterruptionRequested(): self.finished.emit(self.key, QPixmap(), 120.0, 0, None, 44100, "", "", "")
 
 class RubberBandWorker(QThread):
     finished = pyqtSignal(str, str, float)
@@ -136,144 +171,126 @@ class VJDeck:
         self.name = name; self.video_item = video_item
         self.current_filepath = None; self.base_wav_path = None
         self.is_looping = True 
-        self.attack_ms = 10  # Default Attack
-        self.release_ms = 10 # Default Release
+        self.attack_ms = 10; self.release_ms = 10
+        self.fade_level = 0.0; self.envelope_state = "IDLE"
+        self.seq_current_step = 0
+        
+        # Audio Paths
+        self.base_wav = None; self.bass_wav = None; self.treble_wav = None
         
         self.player = QMediaPlayer(); self.player.setVideoOutput(self.video_item); self.player.setLoops(QMediaPlayer.Loops.Infinite) 
         self.player.mediaStatusChanged.connect(self.on_media_status)
         self.video_audio = QAudioOutput(); self.player.setAudioOutput(self.video_audio); self.video_audio.setVolume(0) 
+        
         self.audio_player = QMediaPlayer(); self.main_output = QAudioOutput(); self.audio_player.setAudioOutput(self.main_output); self.audio_player.setLoops(QMediaPlayer.Loops.Infinite)
         self.cue_player = QMediaPlayer(); self.cue_output = QAudioOutput(); self.cue_player.setAudioOutput(self.cue_output); self.cue_player.setLoops(QMediaPlayer.Loops.Infinite)
-        self.cue_active = False; self.raw_samples = None; self.sample_rate = 44100; self.target_volume = 1.0; self.playback_rate = 1.0
         
-        # Envelope State
-        self.fade_level = 0.0
-        self.envelope_state = "IDLE" # IDLE, ATTACK, SUSTAIN, RELEASE
+        self.player_bass = QMediaPlayer(); self.out_bass = QAudioOutput(); self.player_bass.setAudioOutput(self.out_bass)
+        self.player_treble = QMediaPlayer(); self.out_treble = QAudioOutput(); self.player_treble.setAudioOutput(self.out_treble)
         
-        self.fade_timer = QTimer(); self.fade_timer.setInterval(20); self.fade_timer.timeout.connect(self._process_envelope)
-
-    def set_envelope_params(self, attack, release):
-        self.attack_ms = max(1, attack)
-        self.release_ms = max(1, release)
+        for p in [self.player_bass, self.player_treble]: p.setLoops(QMediaPlayer.Loops.Infinite)
+        
+        self.cue_active = False; self.raw_samples = None; self.sample_rate = 44100; 
+        self.target_volume = 1.0; self.playback_rate = 1.0; self.filter_val = 50 
+        
+        self.fade_timer = QTimer(); self.fade_timer.setInterval(5); self.fade_timer.timeout.connect(self._process_envelope)
 
     def set_loop_mode(self, looping):
         self.is_looping = looping; loop_const = QMediaPlayer.Loops.Infinite if looping else QMediaPlayer.Loops.Once
         self.player.setLoops(loop_const); self.audio_player.setLoops(loop_const); self.cue_player.setLoops(loop_const)
+        self.player_bass.setLoops(loop_const); self.player_treble.setLoops(loop_const)
 
     def on_media_status(self, status):
-        # Trigger release on end of media (if one-shot)
         if not self.is_looping and status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.envelope_state = "RELEASE"
-            # Audio player might stop on its own, but we ensure fade logic knows
+            self.audio_player.stop(); self.cue_player.stop(); self.player_bass.stop(); self.player_treble.stop()
 
     def load_video(self, filepath): self.current_filepath = filepath; self.player.setSource(QUrl.fromLocalFile(filepath))
-    def load_base_audio(self, wav_path): self.base_wav_path = wav_path; self.swap_audio(wav_path, reset_rate_to_video=True)
     
-    def swap_audio(self, path, reset_rate_to_video=False):
-        pos = self.player.position(); playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState; url = QUrl.fromLocalFile(path)
-        self.audio_player.setSource(url); self.cue_player.setSource(url)
-        loop_const = QMediaPlayer.Loops.Infinite if self.is_looping else QMediaPlayer.Loops.Once
-        self.audio_player.setLoops(loop_const); self.cue_player.setLoops(loop_const)
-        if reset_rate_to_video:
-            self.audio_player.setPlaybackRate(self.playback_rate); self.cue_player.setPlaybackRate(self.playback_rate)
-            self.audio_player.setPosition(pos); self.cue_player.setPosition(pos)
+    def load_stems(self, wav, bass, treble):
+        self.base_wav = wav; self.bass_wav = bass; self.treble_wav = treble
+        self.swap_audio(reset_rate=True)
+
+    def swap_audio(self, reset_rate=False):
+        b_url = QUrl.fromLocalFile(self.bass_wav) if self.bass_wav else QUrl.fromLocalFile(self.base_wav)
+        t_url = QUrl.fromLocalFile(self.treble_wav) if self.treble_wav else QUrl.fromLocalFile(self.base_wav)
+        pos = self.player.position(); playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        self.player_bass.setSource(b_url); self.player_treble.setSource(t_url)
+        if reset_rate:
+            self.player_bass.setPlaybackRate(self.playback_rate); self.player_treble.setPlaybackRate(self.playback_rate)
+            self.player_bass.setPosition(pos); self.player_treble.setPosition(pos)
         else:
-            self.audio_player.setPlaybackRate(1.0); self.cue_player.setPlaybackRate(1.0)
-            mapped_pos = int(pos / self.playback_rate); self.audio_player.setPosition(mapped_pos); self.cue_player.setPosition(mapped_pos)
-        if playing: self.audio_player.play(); self.cue_player.play() if self.cue_active else None
-        
+            self.player_bass.setPlaybackRate(1.0); self.player_treble.setPlaybackRate(1.0)
+            mapped = int(pos / self.playback_rate); self.player_bass.setPosition(mapped); self.player_treble.setPosition(mapped)
+        if playing: self.player_bass.play(); self.player_treble.play()
+
     def has_media(self): return self.player.mediaStatus() != QMediaPlayer.MediaStatus.NoMedia
     def set_audio_data(self, samples, rate): self.raw_samples = samples; self.sample_rate = rate
-    def find_zero_crossing(self, target_ms): return target_ms # Simplified for envelope reliance
     
+    def find_zero_crossing(self, target_ms):
+        if self.raw_samples is None: return target_ms
+        idx = int((target_ms / 1000.0) * self.sample_rate)
+        search_window = int(0.02 * self.sample_rate) 
+        start = max(0, idx - search_window); end = min(len(self.raw_samples), idx + search_window)
+        if start >= end: return target_ms
+        segment = self.raw_samples[start:end]
+        if len(segment) == 0: return target_ms
+        min_idx = np.argmin(np.abs(segment))
+        best_ms = int(((start + min_idx) / self.sample_rate) * 1000.0)
+        return best_ms
+
     def trigger(self, pos):
-        # 1. Reset volume for Attack
-        self.fade_level = 0.0
-        self.main_output.setVolume(0)
-        self.video_item.setOpacity(0)
-        
-        # 2. Seek & Play
-        self.player.setPosition(pos)
-        a_pos = int(pos / self.playback_rate) if (self.audio_player.playbackRate() == 1.0 and self.playback_rate != 1.0) else pos
-        self.audio_player.setPosition(a_pos); self.cue_player.setPosition(a_pos) if self.cue_active else None
-        
+        self.out_bass.setMuted(True); self.out_treble.setMuted(True); self.video_item.setOpacity(0)
+        safe_pos = self.find_zero_crossing(pos)
+        self.player.setPosition(safe_pos)
+        a_pos = int(safe_pos / self.playback_rate) if (self.player_bass.playbackRate() == 1.0 and self.playback_rate != 1.0) else safe_pos
+        self.player_bass.setPosition(a_pos); self.player_treble.setPosition(a_pos)
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self.player.play(); self.audio_player.play(); self.cue_player.play() if self.cue_active else None
-            
-        # 3. Start Attack Phase
-        self.envelope_state = "ATTACK"
+            self.player.play(); self.player_bass.play(); self.player_treble.play()
+        self.fade_level = 0.0; self.out_bass.setMuted(False); self.out_treble.setMuted(False)
+        self.envelope_state = "ATTACK"; 
         if not self.fade_timer.isActive(): self.fade_timer.start()
 
     def _process_envelope(self):
-        step_time = 20.0 # Timer interval ms
-        
+        step_time = 5.0
         if self.envelope_state == "ATTACK":
-            # Increment
-            step = step_time / self.attack_ms
-            self.fade_level += step
-            if self.fade_level >= 1.0:
-                self.fade_level = 1.0
-                self.envelope_state = "SUSTAIN"
-                
+            self.fade_level += step_time / self.attack_ms
+            if self.fade_level >= 1.0: self.fade_level = 1.0; self.envelope_state = "SUSTAIN"
         elif self.envelope_state == "RELEASE":
-            # Decrement
-            step = step_time / self.release_ms
-            self.fade_level -= step
-            if self.fade_level <= 0.0:
-                self.fade_level = 0.0
-                self.envelope_state = "IDLE"
-                self.pause() # Stop playing when fully released
-                self.fade_timer.stop()
-                
-        elif self.envelope_state == "SUSTAIN":
-            self.fade_level = 1.0
-            # Keep timer running to catch volume changes or mode switches
-            # optimize: could stop timer, but simplified logic here
-            
-        # APPLY VOLUME
-        current_vol = self.target_volume * self.fade_level
-        self.main_output.setVolume(current_vol)
-        self.video_item.setOpacity(current_vol) # Visual feedback
-        if self.cue_active: self.cue_output.setVolume(1.0 * self.fade_level)
+            self.fade_level -= step_time / self.release_ms
+            if self.fade_level <= 0.0: self.fade_level = 0.0; self.envelope_state = "IDLE"; self.pause(); self.fade_timer.stop()
+        elif self.envelope_state == "SUSTAIN": self.fade_level = 1.0
+        self.apply_volume()
 
-    def set_volume(self, vol): 
-        self.target_volume = vol
-        # Immediate update if in Sustain
-        if self.envelope_state == "SUSTAIN":
-            self.main_output.setVolume(self.target_volume)
-            self.video_item.setOpacity(self.target_volume)
+    def set_filter(self, val): self.filter_val = val; self.apply_volume()
+    def set_volume(self, vol): self.target_volume = vol; self.apply_volume()
 
-    def set_cue_active(self, active):
-        self.cue_active = active
-        if active: self.cue_output.setVolume(1.0); self.cue_player.setPosition(self.audio_player.position()); self.cue_player.play() if self.audio_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState else None
-        else: self.cue_output.setVolume(0)
-        
+    def apply_volume(self):
+        base_vol = self.target_volume * self.fade_level
+        self.video_item.setOpacity(base_vol) 
+        if self.filter_val <= 50:
+            bass_mult = 1.0; treble_mult = self.filter_val / 50.0
+        else:
+            bass_mult = 1.0 - ((self.filter_val - 50) / 50.0); treble_mult = 1.0
+        self.out_bass.setVolume(base_vol * bass_mult)
+        self.out_treble.setVolume(base_vol * treble_mult)
+
     def play(self): 
         if not self.is_looping and self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia: self.seek(0)
-        self.trigger(self.player.position()) # Use trigger to get attack envelope
-        
-    def pause(self): 
-        # Instant pause, or trigger release? Standard pause is instant.
-        self.player.pause(); self.audio_player.pause(); self.cue_player.pause()
-        
-    def stop_with_release(self):
-        self.envelope_state = "RELEASE"
-        if not self.fade_timer.isActive(): self.fade_timer.start()
-
+        self.trigger(self.player.position()) 
+    def pause(self): self.player.pause(); self.player_bass.pause(); self.player_treble.pause()
     def seek(self, pos): 
         self.player.setPosition(pos)
-        a_pos = int(pos / self.playback_rate) if (self.audio_player.playbackRate() == 1.0 and self.playback_rate != 1.0) else pos
-        self.audio_player.setPosition(a_pos); self.cue_player.setPosition(a_pos) if self.cue_active else None
-        
+        a_pos = int(pos / self.playback_rate) if (self.player_bass.playbackRate() == 1.0 and self.playback_rate != 1.0) else pos
+        self.player_bass.setPosition(a_pos); self.player_treble.setPosition(a_pos)
     def position(self): return self.player.position()
     def duration(self): return self.player.duration()
     def playbackState(self): return self.player.playbackState()
     def setPlaybackRate(self, rate): 
         self.playback_rate = rate; self.player.setPlaybackRate(rate)
-        if self.base_wav_path and self.audio_player.playbackRate() == 1.0: self.swap_audio(self.base_wav_path, reset_rate_to_video=True)
-        self.audio_player.setPlaybackRate(rate); self.cue_player.setPlaybackRate(rate)
-    def set_main_output(self, device): self.main_output.setDevice(device)
-    def set_cue_output(self, device): self.cue_output.setDevice(device)
+        if self.base_wav_path and self.player_bass.playbackRate() == 1.0: self.swap_audio(reset_rate=True)
+        self.player_bass.setPlaybackRate(rate); self.player_treble.setPlaybackRate(rate)
+    def set_main_output(self, device): self.out_bass.setDevice(device); self.out_treble.setDevice(device)
+    def set_cue_output(self, device): pass
 
 class InteractiveWaveform(QLabel):
     def __init__(self, key_char, color, parent_app):
@@ -398,8 +415,10 @@ class PianoRollSequencer(QWidget):
         if not self.redo_stack: return
         self.undo_stack.append(self.points.copy()); self.points = self.redo_stack.pop(); self.selection.clear(); self.update(); self.parent_app.save_curve_data()
     def set_loop_window(self, start, length):
-        self.loop_length = length; self.loop_start = max(0, min(start, 64 - length)); self.update()
+        # FORCE INT CASTING to prevent TypeError crash
+        self.loop_length = int(length); self.loop_start = max(0, min(int(start), 64 - self.loop_length)); self.update()
         if hasattr(self.parent_app, 'loop_bar'): self.parent_app.loop_bar.update()
+        self.parent_app.update_active_track_loop(self.loop_start, self.loop_length)
     def set_data(self, data): self.points = data.copy() if data else {}; self.selection.clear(); self.undo_stack.clear(); self.redo_stack.clear(); self.update()
     def get_data(self): return self.points
     def get_step_from_x(self, x): return max(0, min(int(x / (self.width()/self.steps)), self.steps - 1))
@@ -442,7 +461,7 @@ class PianoRollSequencer(QWidget):
         steps = int(math.hypot(p2.x()-p1.x(), p2.y()-p1.y()) / 5) + 1 
         for i in range(steps + 1): t = i / steps; self.erase_at_pos(QPointF(p1.x() + (p2.x()-p1.x())*t, p1.y() + (p2.y()-p1.y())*t))
     def mousePressEvent(self, event):
-        self.setFocus(); self.state_at_press = self.points.copy(); pos = event.position(); self.last_mouse_pos = pos; step = self.get_step_from_x(pos.x())
+        self.setFocus(); self.state_at_press = {'points': self.points.copy(), 'selection': self.selection.copy()}; pos = event.position(); self.last_mouse_pos = pos; step = self.get_step_from_x(pos.x())
         if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) or (event.button() == Qt.MouseButton.RightButton):
             self.mode = "ERASING"; self.setCursor(Qt.CursorShape.ForbiddenCursor); self.erase_at_pos(pos); return
         clicked = -1
@@ -485,7 +504,10 @@ class PianoRollSequencer(QWidget):
             self.setCursor(Qt.CursorShape.OpenHandCursor if hover else Qt.CursorShape.ArrowCursor)
         self.last_mouse_pos = pos
     def mouseReleaseEvent(self, event):
-        if self.points != self.state_at_press: self.push_to_undo(self.state_at_press)
+        if self.points != self.state_at_press['points']: 
+            self.undo_stack.append(self.state_at_press) # Push start state
+            if len(self.undo_stack) > 50: self.undo_stack.pop(0)
+            self.redo_stack.clear()
         self.mode = "IDLE"; self.marquee_rect = QRectF(); self.setCursor(Qt.CursorShape.ArrowCursor); self.parent_app.save_curve_data(); self.update()
     def dragged_rect(self, p1, p2): return QRectF(p1, p2).normalized()
     def paintEvent(self, event):
@@ -494,7 +516,9 @@ class PianoRollSequencer(QWidget):
         painter.fillRect(0, 0, lx, h, QColor(0,0,0,180)); painter.fillRect(lx+lw, 0, w-(lx+lw), h, QColor(0,0,0,180))
         painter.setPen(QPen(QColor(40,40,40), 1)); [painter.drawLine(int(i*step_w),0,int(i*step_w),h) for i in range(0,64,4)]
         painter.setPen(QPen(QColor(30,30,30), 1)); [painter.drawLine(0,int(i*(h/5)),w,int(i*(h/5))) for i in range(1,5)]
-        painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(255,255,255,30)); painter.drawRect(int(self.current_step*step_w), 0, int(step_w), h)
+        if self.parent_app.tracks[self.parent_app.active_edit_track].seq_current_step >= 0:
+            ph_x = int(self.parent_app.tracks[self.parent_app.active_edit_track].seq_current_step * step_w)
+            painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(255,255,255,30)); painter.drawRect(ph_x, 0, int(step_w), h)
         for s, v in self.points.items():
             in_loop = self.loop_start <= s < (self.loop_start + self.loop_length)
             painter.setBrush(QColor("#FFFFFF") if s in self.selection else (QColor("#00CCFF") if in_loop else QColor("#004455")))
@@ -510,7 +534,7 @@ class PianoRollSequencer(QWidget):
 class LooperApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VJ Sequencer v25.0 (Envelopes)")
+        self.setWindowTitle("VJ Sequencer v30.0 (Battery Proof)")
         self.resize(800, 750)
         QApplication.instance().setStyleSheet(DARK_THEME)
 
@@ -523,7 +547,6 @@ class LooperApp(QMainWindow):
         
         self.midi_worker = MidiWorker(); self.midi_worker.message_received.connect(self.handle_midi_message); self.midi_worker.start()
 
-        # --- 2x2 VIDEO GRID SCENE ---
         self.projector = QWidget(); self.projector.resize(800,600); self.projector.setStyleSheet("background:black")
         self.proj_scene = QGraphicsScene(0,0,800,600); self.proj_view = QGraphicsView(self.projector); self.proj_view.setViewport(QOpenGLWidget()); self.proj_view.resize(800,600); self.proj_view.setScene(self.proj_scene)
         self.proj_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); self.proj_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -537,10 +560,20 @@ class LooperApp(QMainWindow):
         self.tracks = {}; 
         for k in keys: self.tracks[k] = VJDeck(f"Track {k.upper()}", self.track_items[k])
 
-        self.buttons = {}; self.faders = {}; self.mute_buttons = {}
-        self.bank_data = {0: {}, 1: {}, 2: {}}; self.clip_meta = {}; self.clip_curves = {}; self.clip_loops = {}
-        self.active_edit_track = 'a'; self.current_bank = 0; self.current_generation = 0; self.active_workers = []; self.master_bpm = 120.0; self.tap_times = []; self.transport_start_time = time.time()
-        self.seq_running = False; self.current_step = 0; self.seq_multiplier = 1.0; self.seq_timer = QTimer(); self.seq_timer.setTimerType(Qt.TimerType.PreciseTimer); self.seq_timer.timeout.connect(self.run_sequencer_step)
+        self.buttons = {}; self.faders = {}; self.mute_buttons = {}; self.dials = {}
+        self.bank_data = {0: {}, 1: {}, 2: {}}; self.clip_meta = {}; self.clip_sequencer_data = {}; self.clip_curves = {}; self.clip_loops = {}
+        self.active_edit_track = 'a'; self.current_bank = 0; self.current_generation = 0; self.active_workers = []; self.master_bpm = 120.0; self.tap_times = []; 
+        
+        # --- NEW TIMING SYSTEM ---
+        self.transport_start_time = 0.0 # Will be reset on play
+        self.last_processed_step_global = -1 # Monotonic counter of 16th notes since start
+        
+        self.seq_running = False; self.current_step = 0; self.seq_multiplier = 1.0
+        
+        # Precise Timer for Sequencer
+        self.seq_timer = QTimer(); self.seq_timer.setTimerType(Qt.TimerType.PreciseTimer); 
+        self.seq_timer.timeout.connect(self.run_sequencer_step)
+        
         self.mute_states = {'a': False, 's': False, 'd': False, 'f': False}
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True); self.setCentralWidget(scroll); w = QWidget(); w.setObjectName("Container"); scroll.setWidget(w); l = QVBoxLayout(w); l.setSpacing(5)
@@ -594,7 +627,6 @@ class LooperApp(QMainWindow):
             r.toggled.connect(lambda checked, key=k: self.change_edit_track(key) if checked else None); self.rad_group.addButton(r); stools.addWidget(r)
         self.chk_loop_track = QCheckBox("LOOP CLIP"); self.chk_loop_track.toggled.connect(self.toggle_loop_current_track); stools.addWidget(self.chk_loop_track)
         
-        # Attack/Release Sliders
         stools.addSpacing(20)
         stools.addWidget(QLabel("A:"))
         sl_att = QSlider(Qt.Orientation.Horizontal); sl_att.setRange(0, 200); sl_att.setValue(10); sl_att.setFixedWidth(60)
@@ -619,6 +651,11 @@ class LooperApp(QMainWindow):
 
     def create_mixer_strip(self, k, col):
         v = QVBoxLayout()
+        # FILTER KNOB
+        dial = QDial(); dial.setRange(0, 100); dial.setValue(50); dial.setFixedSize(40, 40); dial.setNotchesVisible(True)
+        dial.valueChanged.connect(lambda val, key=k: self.set_track_filter(key, val))
+        self.dials[k] = dial; v.addWidget(dial, 0, Qt.AlignmentFlag.AlignCenter)
+        
         pad = InteractiveWaveform(k, col, self); self.buttons[k] = pad; v.addWidget(pad)
         fader = QSlider(Qt.Orientation.Vertical); fader.setRange(0, 100); fader.setValue(100); fader.setMinimumHeight(120); fader.setMinimumWidth(40)
         fader.valueChanged.connect(lambda val, key=k: self.set_track_volume(key, val))
@@ -663,18 +700,21 @@ class LooperApp(QMainWindow):
 
     def set_track_volume(self, key, val):
         if not self.mute_states[key]: self.tracks[key].set_volume(val / 100.0)
+    
+    def set_track_filter(self, key, val):
+        self.tracks[key].set_filter(val)
 
     def toggle_track_mute(self, key, muted):
         self.mute_states[key] = muted
         self.mute_buttons[key].blockSignals(True); self.mute_buttons[key].setChecked(muted); self.mute_buttons[key].blockSignals(False)
         self.tracks[key].set_volume(0 if muted else self.faders[key].value() / 100.0)
 
-    def prep_done(self, key, pix, bpm, dur, raw, rate, wav):
+    def prep_done(self, key, pix, bpm, dur, raw, rate, wav, bass, treble):
         path = self.bank_data[self.current_bank].get(key)
         if path:
             self.clip_meta[path] = bpm
             self.tracks[key].set_audio_data(raw, rate)
-            self.tracks[key].load_base_audio(wav)
+            self.tracks[key].load_stems(wav, bass, treble) # LOAD STEMS
         self.buttons[key].set_data(pix, bpm, dur)
 
     def switch_bank(self, i):
@@ -688,14 +728,55 @@ class LooperApp(QMainWindow):
 
     def get_target_deck_info(self): t = self.tracks[self.active_edit_track]; return (t, t.current_filepath)
 
+    # --- ABSOLUTE TIME SEQUENCER (BATTERY PROOF) ---
     def run_sequencer_step(self):
-        ls = self.piano_roll.loop_start; ll = self.piano_roll.loop_length
-        self.current_step = ls + ((self.current_step + 1 - ls) % ll)
-        self.piano_roll.current_step = self.current_step; self.piano_roll.update()
+        if not self.seq_running or self.master_bpm <= 0: return
+        
+        # Calculate theoretical step based on elapsed time (immune to throttling)
+        elapsed_min = (time.time() - self.transport_start_time) / 60.0
+        # Total beats elapsed = minutes * BPM
+        # Total steps (16th notes) = total beats * 4 * multiplier
+        # Using multiplier effectively changes the step rate
+        total_steps = int(elapsed_min * self.master_bpm * 4 * self.seq_multiplier)
+        
+        # If we have advanced to a new step (or multiple steps if lag happened)
+        if total_steps > self.last_processed_step_global:
+            # Process ALL steps we missed (catch up visually, but trigger audio only for latest to avoid burst)
+            steps_to_process = total_steps - self.last_processed_step_global
+            
+            # If gap is huge (system sleep), just jump to current
+            if steps_to_process > 16: 
+                self.last_processed_step_global = total_steps - 1
+            
+            # Advance logic
+            while self.last_processed_step_global < total_steps:
+                self.last_processed_step_global += 1
+                # Trigger logic for current step
+                self.trigger_all_tracks_for_step()
+
+    def trigger_all_tracks_for_step(self):
+        # This function updates internal step counters and triggers audio
         for k in ['a','s','d','f']:
             t = self.tracks[k]; path = t.current_filepath
-            if path and path in self.clip_curves and self.current_step in self.clip_curves[path]:
-                t.trigger(int(self.clip_curves[path][self.current_step] * t.duration()))
+            if path and path in self.clip_sequencer_data:
+                # Update track-specific step pointer
+                seq_data = self.clip_sequencer_data[path]
+                ls = int(seq_data['loop_start'])
+                ll = int(seq_data['loop_length'])
+                
+                # Advance step
+                t.seq_current_step = ls + ((t.seq_current_step + 1 - ls) % ll)
+                
+                # Check for trigger note
+                seq_points = seq_data['points']
+                if t.seq_current_step in seq_points:
+                    val = seq_points[t.seq_current_step]
+                    t.trigger(int(val * t.duration()))
+                    
+        # Update UI for active track
+        active_t = self.tracks[self.active_edit_track]
+        self.piano_roll.current_step = active_t.seq_current_step
+        self.piano_roll.update()
 
     def toggle_play_state(self):
         for t in self.tracks.values(): t.play() if t.has_media() and t.playbackState()!=QMediaPlayer.PlaybackState.PlayingState else t.pause()
@@ -716,6 +797,7 @@ class LooperApp(QMainWindow):
 
     def auto_align_phase(self):
         if self.master_bpm <= 0: return
+        # Align using new transport start
         beat_ms = 60000.0/self.master_bpm; phase = (time.time() - self.transport_start_time)*1000 % beat_ms
         for t in self.tracks.values():
             if t.has_media(): diff = phase - (t.position() % beat_ms); t.seek(max(0, int(t.position() + (diff + beat_ms if diff < -beat_ms/2 else diff - beat_ms if diff > beat_ms/2 else diff))))
@@ -726,13 +808,47 @@ class LooperApp(QMainWindow):
         self.master_bpm = round(max(10.0, self.master_bpm + amount), 1); self.bpm_lbl.setText(f"{self.master_bpm} BPM")
         if self.btn_vid_sync.isChecked(): [self.sync_deck(self.tracks[k], k) for k in self.tracks]
         self.update_clock()
-    def update_curve_ui(self): _, path = self.get_target_deck_info(); self.piano_roll.set_data(self.clip_curves.get(path, {}))
-    def save_curve_data(self): _, path = self.get_target_deck_info(); self.clip_curves[path] = self.piano_roll.get_data() if path else None
-    def toggle_sequencer(self): self.seq_running = not self.seq_running; self.btn_run.setChecked(self.seq_running); self.update_clock() if self.seq_running else self.seq_timer.stop()
+    
+    def update_curve_ui(self): 
+        _, path = self.get_target_deck_info()
+        data = self.clip_sequencer_data.get(path, {'points': {}, 'loop_start': 0, 'loop_length': 64})
+        # FORCE INT CASTING
+        self.piano_roll.set_data(data['points'])
+        self.piano_roll.loop_start = int(data['loop_start'])
+        self.piano_roll.loop_length = int(data['loop_length'])
+        self.loop_bar.update()
+
+    def update_active_track_loop(self, start, length):
+        # Callback from PianoRoll to save loop settings
+        path = self.tracks[self.active_edit_track].current_filepath
+        if path:
+            if path not in self.clip_sequencer_data:
+                self.clip_sequencer_data[path] = {'points': {}, 'loop_start': 0, 'loop_length': 64}
+            self.clip_sequencer_data[path]['loop_start'] = int(start)
+            self.clip_sequencer_data[path]['loop_length'] = int(length)
+
+    def save_curve_data(self): 
+        _, path = self.get_target_deck_info()
+        if path:
+            if path not in self.clip_sequencer_data: self.clip_sequencer_data[path] = {'points': {}, 'loop_start': 0, 'loop_length': 64}
+            self.clip_sequencer_data[path]['points'] = self.piano_roll.get_data()
+
+    def toggle_sequencer(self): 
+        self.seq_running = not self.seq_running
+        self.btn_run.setChecked(self.seq_running)
+        if self.seq_running:
+            self.transport_start_time = time.time() # Reset clock base
+            self.last_processed_step_global = -1
+            self.update_clock()
+        else:
+            self.seq_timer.stop()
+
     def update_clock(self):
-        if self.master_bpm > 0: self.seq_timer.setInterval(int(((60000.0 / self.master_bpm) / 4) / self.seq_multiplier)); 
-        if self.seq_running and not self.seq_timer.isActive(): self.seq_timer.start()
-    def change_seq_speed(self, i): self.seq_multiplier = [0.5, 1.0, 2.0][i]; self.update_clock()
+        # Run timer fast (10ms) to check wall clock freq
+        if self.seq_running and not self.seq_timer.isActive(): self.seq_timer.start(10)
+
+    def change_seq_speed(self, i): self.seq_multiplier = [0.5, 1.0, 2.0][i]
+    
     def handle_tap_tempo(self):
         now = time.time(); self.tap_times.append(now)
         if len(self.tap_times)>4: self.tap_times.pop(0)
@@ -766,12 +882,26 @@ class LooperApp(QMainWindow):
             d=json.load(open(f,'r')); self.bank_data=d['banks']
             self.key_bindings={k:int(v) for k,v in d.get('keys',self.key_bindings).items()}
             self.midi_map=d.get('midi',self.midi_map)
-            self.clip_curves={path:{int(k):v for k,v in points.items()} for path,points in d.get('curves',{}).items()}
+            # Migration logic for v26 polyrhythms
+            if 'curves' in d and 'sequencer' not in d:
+                for path, points in d['curves'].items():
+                    self.clip_sequencer_data[path] = {'points': {int(k):v for k,v in points.items()}, 'loop_start':0, 'loop_length':64}
+            else:
+                raw_seq = d.get('sequencer', {})
+                self.clip_sequencer_data = {}
+                for path, data in raw_seq.items():
+                    # FORCE INT CASTING ON LOAD
+                    self.clip_sequencer_data[path] = {
+                        'points': {int(k):v for k,v in data['points'].items()},
+                        'loop_start': int(data['loop_start']),
+                        'loop_length': int(data['loop_length'])
+                    }
             self.clip_loops=d.get('loops', {})
             self.switch_bank(0)
+
     def save_set(self):
         f, _ = QFileDialog.getSaveFileName(self, "Save", "", "JSON (*.json)")
-        if f: json.dump({'banks':self.bank_data, 'curves':self.clip_curves, 'keys':self.key_bindings, 'midi':self.midi_map, 'loops':self.clip_loops}, open(f,'w'))
+        if f: json.dump({'banks':self.bank_data, 'sequencer':self.clip_sequencer_data, 'keys':self.key_bindings, 'midi':self.midi_map, 'loops':self.clip_loops}, open(f,'w'))
 
     def eventFilter(self, src, e):
         if e.type() == QEvent.Type.KeyPress and not e.isAutoRepeat():
